@@ -1,0 +1,10 @@
+{
+  "feishu_app_id": "",
+  "feishu_app_secret": "",
+  "feishu_admin_open_ids": [],
+  "feishu_default_chat_id": "",
+  "browser_headless": true,
+  "browser_timeout_seconds": 10,
+  "max_concurrent_accounts": 3,
+  "create_order_enabled": false
+}

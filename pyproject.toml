@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "piaoxingqiu-auto"
+version = "0.1.0"
+description = "票星球监控、飞书控制与 Playwright 自动创建订单"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "geobuf>=2.0.1,<3",
+    "httpx>=0.27,<1",
+    "lark-oapi==1.7.1",
+    "playwright>=1.53,<2",
+]
+
+[project.scripts]
+piaoxingqiu-auto = "piaoxingqiu_auto.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["piaoxingqiu_auto*"]

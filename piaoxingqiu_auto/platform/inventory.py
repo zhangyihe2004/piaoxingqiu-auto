@@ -1,0 +1,690 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import math
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, TypeVar
+from urllib.parse import urlencode
+
+import geobuf
+
+from piaoxingqiu_auto.platform.auth import AuthGuard, request_context
+from piaoxingqiu_auto.platform.api import is_success_payload
+from piaoxingqiu_auto.domain.sale import POST_SALE_WAIT_SECONDS, presale_poll_interval
+from piaoxingqiu_auto.domain.seating import Candidate, Seat, SeatSelection, select_group
+
+if TYPE_CHECKING:
+    from piaoxingqiu_auto.platform.checkout_page import PurchasePage
+
+
+BATCH_SIZE = 25
+DYNAMIC_CONCURRENCY = 4
+DOWNLOAD_CONCURRENCY = 5
+FAST_STOCK_POLL_SECONDS = 0.25
+FAST_STOCK_WINDOW_SECONDS = 5.0
+STOCK_POLL_SECONDS = 1.0
+STOCK_WAIT_SECONDS = 60.0
+STATIC_UNAVAILABLE_CODE = "22024036"
+STATIC_LAYOUT_CACHE_SIZE = 16
+STATIC_RETRY_CACHE_SIZE = 64
+DECODED_RESOURCE_CACHE_SIZE = 64
+T = TypeVar("T")
+
+
+class InventoryUnavailable(RuntimeError):
+    pass
+
+
+class StaticInventoryUnavailable(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class StaticLayout:
+    resources: dict[str, str]
+    plan_zones: dict[str, frozenset[str]]
+
+
+_STATIC_LAYOUTS: OrderedDict[str, StaticLayout] = OrderedDict()
+_STATIC_LOADS: dict[str, asyncio.Task[StaticLayout]] = {}
+_STATIC_RETRY_AT: OrderedDict[str, float] = OrderedDict()
+_DECODED_RESOURCES: OrderedDict[str, tuple[Seat, ...]] = OrderedDict()
+_DECODE_LOADS: dict[str, asyncio.Task[tuple[Seat, ...]]] = {}
+_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
+
+
+def _cache_get(cache: OrderedDict[str, T], key: str) -> T | None:
+    value = cache.pop(key, None)
+    if value is not None:
+        cache[key] = value
+    return value
+
+
+def _cache_put(
+    cache: OrderedDict[str, T],
+    key: str,
+    value: T,
+    limit: int,
+) -> None:
+    cache.pop(key, None)
+    cache[key] = value
+    while len(cache) > limit:
+        cache.popitem(last=False)
+
+
+@dataclass(frozen=True)
+class GeneralAdmissionSelection:
+    plan: str
+    plan_id: str
+    quantity: int
+    units: int
+
+
+@dataclass
+class GeneralAdmissionInventory:
+    site: PurchasePage
+    endpoint: str
+    common: dict[str, str]
+    headers: dict[str, str]
+    plan_names: tuple[str, ...]
+    plan_ids: tuple[str, ...]
+
+    @classmethod
+    def open(
+        cls,
+        site: PurchasePage,
+        auth: AuthGuard,
+    ) -> GeneralAdmissionInventory:
+        show_id, session_id = site.booking_ids
+        origin = site.origin
+        if not auth.headers:
+            raise RuntimeError("库存查询缺少已验证的登录状态")
+        return cls(
+            site=site,
+            endpoint=(
+                f"{origin}/cyy_gatewayapi/show/pub/v5/show/{show_id}/session/"
+                f"{session_id}/seat_plans"
+            ),
+            common=request_context(auth.headers),
+            headers=auth.headers,
+            plan_names=site.config.purchase.plans,
+            plan_ids=site.config.purchase.plan_ids,
+        )
+
+    async def refresh(self, quantity: int) -> GeneralAdmissionSelection:
+        query = dict(self.common, source="FROM_QUICK_ORDER", src="WEB")
+        response = await self.site.page.context.request.get(
+            _url(self.endpoint, query), headers=self.headers
+        )
+        if not response.ok:
+            raise RuntimeError(f"票档库存接口返回 HTTP {response.status}")
+        data = _response_data(await response.json(), "票档库存接口")
+        if not isinstance(data, dict) or not isinstance(data.get("seatPlans"), list):
+            raise RuntimeError("票档库存接口缺少 seatPlans 数组")
+        live = {
+            str(item.get("seatPlanId") or ""): item
+            for item in data["seatPlans"]
+            if isinstance(item, dict)
+        }
+        options: list[GeneralAdmissionSelection] = []
+        for name, plan_id in zip(self.plan_names, self.plan_ids):
+            item = live.get(plan_id)
+            if not item or not item.get("saleStarted"):
+                continue
+            can_buy = int(item.get("canBuyCount") or 0)
+            unit_qty = max(1, int(item.get("unitQty") or 1))
+            units = min(can_buy, quantity // unit_qty)
+            if units > 0:
+                options.append(
+                    GeneralAdmissionSelection(
+                        plan=name,
+                        plan_id=plan_id,
+                        quantity=units * unit_qty,
+                        units=units,
+                    )
+                )
+        if not options:
+            raise InventoryUnavailable("配置票档当前均没有可售票")
+        full = next((option for option in options if option.quantity == quantity), None)
+        return full or max(options, key=lambda option: option.quantity)
+
+    async def wait_available(self, quantity: int) -> GeneralAdmissionSelection:
+        return await _wait_inventory(lambda: self.refresh(quantity))
+
+
+@dataclass
+class InventoryBootstrap:
+    site: PurchasePage
+    endpoint: str
+    plan_endpoint: str
+    static_url: str
+    common: dict[str, str]
+    headers: dict[str, str]
+    plan_names: tuple[str, ...]
+    plan_ids: tuple[str, ...]
+
+    @classmethod
+    def open(
+        cls,
+        site: PurchasePage,
+        auth: AuthGuard,
+    ) -> InventoryBootstrap:
+        show_id, session_id = site.booking_ids
+        origin = site.origin
+        headers = auth.headers
+        if not headers:
+            raise RuntimeError("库存预热缺少已验证的登录状态")
+        common = request_context(headers)
+        root = f"{origin}/cyy_gatewayapi/show"
+        plan_names = site.config.purchase.plans
+        plan_ids = site.config.purchase.plan_ids
+        static_url = _url(
+            f"{root}/pub/v5/show/{show_id}/session/{session_id}/seating/static",
+            common,
+        )
+        return cls(
+            site=site,
+            endpoint=f"{root}/buyer/v5/show/{show_id}/session/{session_id}/seating/dynamic",
+            plan_endpoint=f"{root}/pub/v5/show/{show_id}/session/{session_id}/seat_plans",
+            static_url=static_url,
+            common=common,
+            headers=headers,
+            plan_names=plan_names,
+            plan_ids=plan_ids,
+        )
+
+    async def activate(self, *, preload: bool = False) -> Inventory:
+        layout = await _load_static_layout(self.site, self.static_url)
+        return await self._inventory(layout, preload)
+
+    async def _inventory(
+        self,
+        layout: StaticLayout,
+        preload: bool,
+    ) -> Inventory:
+        zone_ids = {
+            zone_id
+            for plan_id in self.plan_ids
+            for zone_id in layout.plan_zones.get(plan_id, ())
+            if zone_id in layout.resources
+        }
+        zones = (
+            await _decode_zones(self.site, layout.resources, zone_ids)
+            if preload and zone_ids
+            else {}
+        )
+        return Inventory(
+            site=self.site,
+            endpoint=self.endpoint,
+            plan_endpoint=self.plan_endpoint,
+            common=self.common,
+            headers=self.headers,
+            plan_names=self.plan_names,
+            plan_ids=self.plan_ids,
+            resources=layout.resources,
+            zones=zones,
+        )
+
+    async def wait_static(
+        self,
+        *,
+        remaining_seconds: float | None = None,
+        preload: bool = False,
+    ) -> Inventory:
+        if remaining_seconds is None:
+            return await _wait_inventory(lambda: self.activate(preload=preload))
+        layout = await _wait_static_layout(
+            self.site,
+            self.static_url,
+            remaining_seconds,
+        )
+        return await self._inventory(layout, preload)
+
+
+async def _wait_static_layout(
+    site: PurchasePage,
+    url: str,
+    remaining_seconds: float,
+) -> StaticLayout:
+    key = url.partition("?")[0]
+    if layout := _cache_get(_STATIC_LAYOUTS, key):
+        return layout
+    loop = asyncio.get_running_loop()
+    sale_at = loop.time() + remaining_seconds
+    deadline = sale_at + POST_SALE_WAIT_SECONDS
+    while True:
+        now = loop.time()
+        if now >= deadline:
+            raise StaticInventoryUnavailable("静态座位资源尚未下发")
+        if (retry_at := _cache_get(_STATIC_RETRY_AT, key) or 0.0) > now:
+            await asyncio.sleep(min(retry_at, deadline) - now)
+            continue
+        try:
+            return await _load_static_layout(site, url)
+        except StaticInventoryUnavailable:
+            remaining = sale_at - loop.time()
+            _cache_put(
+                _STATIC_RETRY_AT,
+                key,
+                loop.time()
+                + min(
+                    presale_poll_interval(remaining),
+                    deadline - loop.time(),
+                ),
+                STATIC_RETRY_CACHE_SIZE,
+            )
+
+
+@dataclass
+class Inventory:
+    site: PurchasePage
+    endpoint: str
+    plan_endpoint: str
+    common: dict[str, str]
+    headers: dict[str, str]
+    plan_names: tuple[str, ...]
+    plan_ids: tuple[str, ...]
+    resources: dict[str, str]
+    zones: dict[str, tuple[Seat, ...]]
+
+    @classmethod
+    async def open(cls, site: PurchasePage, auth: AuthGuard) -> Inventory:
+        return await InventoryBootstrap.open(site, auth).activate()
+
+    async def refresh(
+        self,
+        quantity: int,
+    ) -> SeatSelection:
+        records, plan_caps = await asyncio.gather(
+            _timed(
+                self.site,
+                "dynamic",
+                _fetch_all_dynamic(
+                    self.site,
+                    self.endpoint,
+                    self.common,
+                    self.headers,
+                    tuple(self.resources),
+                    self.plan_ids,
+                ),
+            ),
+            _timed(
+                self.site,
+                "plan_inventory",
+                _fetch_plan_caps(
+                    self.site,
+                    self.plan_endpoint,
+                    self.common,
+                    self.headers,
+                    self.plan_ids,
+                ),
+            ),
+        )
+        inventories = {
+            (rank, plan_name, plan_id): {
+                str(record["zoneConcreteId"]): bits
+                for record in records
+                if (bits := _plan_bits(record, plan_id)) and any(bits)
+            }
+            for rank, (plan_name, plan_id) in enumerate(
+                zip(self.plan_names, self.plan_ids)
+            )
+            if plan_caps.get(plan_id, 0) > 0
+        }
+        live_zone_ids = {
+            zone_id for bitsets in inventories.values() for zone_id in bitsets
+        }
+        if not live_zone_ids:
+            raise InventoryUnavailable("配置票档当前均没有可售座位")
+        missing = live_zone_ids - self.zones.keys()
+        if missing:
+            started = asyncio.get_running_loop().time()
+            self.zones.update(await _decode_zones(self.site, self.resources, missing))
+            self.site.record_timing(
+                "seat_decode", asyncio.get_running_loop().time() - started
+            )
+
+        started = asyncio.get_running_loop().time()
+        available: dict[str, Candidate] = {}
+        for (rank, plan_name, plan_id), bitsets in inventories.items():
+            for zone_id, bits in bitsets.items():
+                for seat in self.zones[zone_id]:
+                    if _bit_is_set(bits, seat.seat_no):
+                        available.setdefault(
+                            seat.seat_id,
+                            Candidate(seat, plan_name, plan_id, rank),
+                        )
+        if not available:
+            raise RuntimeError("动态库存存在，但未能映射到静态座位")
+        candidates = tuple(available.values())
+        counts = {
+            plan_id: sum(candidate.plan_id == plan_id for candidate in candidates)
+            for plan_id in self.plan_ids
+        }
+        selected_quantity = min(
+            quantity,
+            sum(min(plan_caps.get(plan_id, 0), count) for plan_id, count in counts.items()),
+        )
+        selected = next(
+            (
+                group
+                for current_quantity in range(selected_quantity, 0, -1)
+                if (
+                    group := select_group(candidates, current_quantity, plan_caps)
+                )
+                is not None
+            ),
+            None,
+        )
+        if selected is None:
+            raise RuntimeError("可售座位无法组成有效选择")
+        self.site.record_timing(
+            "seat_score", asyncio.get_running_loop().time() - started
+        )
+        selected_candidates = tuple(
+            sorted(
+                selected.candidates,
+                key=lambda item: (item.seat.zone_id, item.seat.seat_no),
+            )
+        )
+        return SeatSelection(candidates=selected_candidates)
+
+    async def wait_available(self, quantity: int) -> SeatSelection:
+        return await _wait_inventory(lambda: self.refresh(quantity))
+
+
+async def _wait_inventory(load: Callable[[], Awaitable[T]]) -> T:
+    started = asyncio.get_running_loop().time()
+    while True:
+        try:
+            return await load()
+        except (InventoryUnavailable, StaticInventoryUnavailable):
+            elapsed = asyncio.get_running_loop().time() - started
+            if elapsed >= STOCK_WAIT_SECONDS:
+                raise
+            await asyncio.sleep(_stock_poll_delay(elapsed))
+
+
+async def _timed(
+    site: PurchasePage,
+    stage: str,
+    operation: Awaitable[T],
+) -> T:
+    started = asyncio.get_running_loop().time()
+    try:
+        return await operation
+    finally:
+        site.record_timing(stage, asyncio.get_running_loop().time() - started)
+
+
+def _stock_poll_delay(elapsed: float) -> float:
+    interval = (
+        FAST_STOCK_POLL_SECONDS
+        if elapsed < FAST_STOCK_WINDOW_SECONDS
+        else STOCK_POLL_SECONDS
+    )
+    return min(interval, STOCK_WAIT_SECONDS - elapsed)
+
+
+async def _fetch_all_dynamic(
+    site: PurchasePage,
+    endpoint: str,
+    common: dict[str, str],
+    headers: dict[str, str],
+    zone_ids: tuple[str, ...],
+    plan_ids: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    semaphore = asyncio.Semaphore(DYNAMIC_CONCURRENCY)
+
+    async def fetch(batch: tuple[str, ...]) -> list[dict[str, Any]]:
+        query = dict(common)
+        query.update(
+            zoneConcreteIds=",".join(batch),
+            bizSeatPlanIds=",".join(plan_ids),
+        )
+        async with semaphore:
+            response = await site.page.context.request.get(
+                _url(endpoint, query), headers=headers
+            )
+        if not response.ok:
+            raise RuntimeError(f"批量动态座位接口返回 HTTP {response.status}")
+        data = _response_data(await response.json(), "批量动态座位接口")
+        if not isinstance(data, list):
+            raise RuntimeError("批量动态座位接口缺少 data 数组")
+        return [item for item in data if isinstance(item, dict)]
+
+    batches = await asyncio.gather(
+        *(
+            fetch(zone_ids[start : start + BATCH_SIZE])
+            for start in range(0, len(zone_ids), BATCH_SIZE)
+        )
+    )
+    return [record for batch in batches for record in batch]
+
+
+async def _fetch_plan_caps(
+    site: PurchasePage,
+    endpoint: str,
+    common: dict[str, str],
+    headers: dict[str, str],
+    plan_ids: tuple[str, ...],
+) -> dict[str, int]:
+    query = dict(common, source="FROM_QUICK_ORDER", src="WEB")
+    response = await site.page.context.request.get(
+        _url(endpoint, query), headers=headers
+    )
+    if not response.ok:
+        raise RuntimeError(f"票档库存接口返回 HTTP {response.status}")
+    data = _response_data(await response.json(), "票档库存接口")
+    if not isinstance(data, dict) or not isinstance(data.get("seatPlans"), list):
+        raise RuntimeError("票档库存接口缺少 seatPlans 数组")
+    wanted = set(plan_ids)
+    return {
+        str(item.get("seatPlanId")): int(item.get("canBuyCount") or 0)
+        for item in data["seatPlans"]
+        if isinstance(item, dict) and str(item.get("seatPlanId")) in wanted
+    }
+
+
+def _plan_bits(record: dict[str, Any], plan_id: str) -> bytes:
+    for item in record.get("seatPlanSeatBits", []):
+        if isinstance(item, dict) and str(item.get("bizSeatPlanId")) == plan_id:
+            value = str(item.get("bitstr") or "")
+            return base64.b64decode(value + "=" * (-len(value) % 4))
+    return b""
+
+
+def _response_data(payload: Any, label: str) -> Any:
+    if not is_success_payload(payload):
+        status = payload.get("statusCode") if isinstance(payload, dict) else None
+        raise RuntimeError(f"{label}返回异常业务状态（{status or '无状态码'}）")
+    if "data" not in payload:
+        raise RuntimeError(f"{label}缺少 data")
+    return payload["data"]
+
+
+def _static_data(payload: Any) -> dict[str, Any]:
+    if (
+        isinstance(payload, dict)
+        and str(payload.get("statusCode")) == STATIC_UNAVAILABLE_CODE
+    ):
+        raise StaticInventoryUnavailable("静态座位资源尚未下发")
+    data = _response_data(payload, "静态座位接口")
+    if not isinstance(data, dict):
+        raise RuntimeError("静态座位接口缺少 data 对象")
+    return data
+
+
+async def _load_static_layout(
+    site: PurchasePage,
+    url: str,
+) -> StaticLayout:
+    key = url.partition("?")[0]
+    if layout := _cache_get(_STATIC_LAYOUTS, key):
+        return layout
+    task = _STATIC_LOADS.get(key)
+    if task is None:
+        task = asyncio.create_task(_fetch_static_layout(site, url))
+        _STATIC_LOADS[key] = task
+    try:
+        layout = await asyncio.shield(task)
+    finally:
+        if task.done() and _STATIC_LOADS.get(key) is task:
+            _STATIC_LOADS.pop(key, None)
+    _cache_put(_STATIC_LAYOUTS, key, layout, STATIC_LAYOUT_CACHE_SIZE)
+    _STATIC_RETRY_AT.pop(key, None)
+    return layout
+
+
+async def _fetch_static_layout(
+    site: PurchasePage,
+    url: str,
+) -> StaticLayout:
+    response = await site.page.context.request.get(url)
+    if response.status in {401, 429, 469}:
+        raise RuntimeError(
+            f"静态座位接口触发限制（HTTP {response.status}），已停止"
+        )
+    if not response.ok:
+        raise RuntimeError(f"静态座位接口返回 HTTP {response.status}")
+    data = _static_data(await response.json())
+    resources = {
+        str(item["zoneConcreteId"]): str(item["url"])
+        for item in data.get("staticResList", [])
+        if isinstance(item, dict)
+        and item.get("dataType") == "ZONE_SEAT_DATA"
+        and item.get("zoneConcreteId")
+        and item.get("url")
+    }
+    if not resources:
+        raise StaticInventoryUnavailable("静态座位资源尚未下发")
+    plan_zones: dict[str, set[str]] = {}
+    for item in data.get("planZoneList", []):
+        if not isinstance(item, dict) or not item.get("seatPlanId"):
+            continue
+        plan_zones.setdefault(str(item["seatPlanId"]), set()).update(
+            str(zone["zoneConcreteId"])
+            for zone in item.get("zoneConcretes", [])
+            if isinstance(zone, dict) and zone.get("zoneConcreteId")
+        )
+    return StaticLayout(
+        resources,
+        {plan_id: frozenset(zones) for plan_id, zones in plan_zones.items()},
+    )
+
+
+async def _decode_zones(
+    site: PurchasePage,
+    resources: dict[str, str],
+    zone_ids: set[str],
+) -> dict[str, tuple[Seat, ...]]:
+    async def decode(zone_id: str) -> tuple[str, tuple[Seat, ...]]:
+        url = resources.get(zone_id)
+        if not url:
+            raise RuntimeError(f"静态座位资源缺少区域 {zone_id}")
+        seats = _cache_get(_DECODED_RESOURCES, url)
+        if seats is None:
+            task = _DECODE_LOADS.get(url)
+            if task is None:
+                task = asyncio.create_task(_decode_resource(site, url, zone_id))
+                _DECODE_LOADS[url] = task
+            try:
+                seats = await asyncio.shield(task)
+            finally:
+                if task.done() and _DECODE_LOADS.get(url) is task:
+                    _DECODE_LOADS.pop(url, None)
+            _cache_put(
+                _DECODED_RESOURCES,
+                url,
+                seats,
+                DECODED_RESOURCE_CACHE_SIZE,
+            )
+        return zone_id, seats
+
+    return dict(await asyncio.gather(*(decode(zone_id) for zone_id in zone_ids)))
+
+
+async def _decode_resource(
+    site: PurchasePage,
+    url: str,
+    zone_id: str,
+) -> tuple[Seat, ...]:
+    async with _DOWNLOAD_SEMAPHORE:
+        response = await site.page.context.request.get(url)
+    if not response.ok:
+        raise RuntimeError(f"看台布局接口返回 HTTP {response.status}")
+    features = geobuf.decode(await response.body()).get("features", [])
+    return _index_rows(
+        tuple(filter(None, (_seat(feature, zone_id) for feature in features)))
+    )
+
+
+def _seat(feature: Any, zone_id: str) -> Seat | None:
+    if not isinstance(feature, dict):
+        return None
+    geometry = feature.get("geometry", {})
+    properties = feature.get("properties", {})
+    coordinates = geometry.get("coordinates") if isinstance(geometry, dict) else None
+    if (
+        not isinstance(properties, dict)
+        or not isinstance(coordinates, list)
+        or len(coordinates) < 2
+    ):
+        return None
+    seat_id = str(properties.get("seatConcreteId") or "")
+    if not seat_id:
+        return None
+    try:
+        return Seat(
+            zone_id=zone_id,
+            zone_name=str(properties.get("zoneName") or zone_id),
+            seat_id=seat_id,
+            row=_row_name(properties),
+            seat_no=int(properties["seatNo"]),
+            x=float(coordinates[0]),
+            y=float(coordinates[1]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _row_name(properties: dict[str, Any]) -> str:
+    prefix, separator, _ = str(properties.get("seatName") or "").rpartition("排")
+    return prefix + separator if separator else str(properties.get("row") or "")
+
+
+def _index_rows(seats: tuple[Seat, ...]) -> tuple[Seat, ...]:
+    rows: dict[str, list[Seat]] = {}
+    for seat in seats:
+        rows.setdefault(seat.row, []).append(seat)
+    indexes: dict[str, int] = {}
+    for row in rows.values():
+        axis = _principal_axis(row)
+        ordered = sorted(
+            row,
+            key=lambda seat: (seat.x * axis[0] + seat.y * axis[1], seat.seat_id),
+        )
+        indexes.update({seat.seat_id: index for index, seat in enumerate(ordered)})
+    return tuple(replace(seat, row_index=indexes[seat.seat_id]) for seat in seats)
+
+
+def _principal_axis(seats: list[Seat]) -> tuple[float, float]:
+    center_x = sum(seat.x for seat in seats) / len(seats)
+    center_y = sum(seat.y for seat in seats) / len(seats)
+    xx = sum((seat.x - center_x) ** 2 for seat in seats)
+    yy = sum((seat.y - center_y) ** 2 for seat in seats)
+    xy = sum((seat.x - center_x) * (seat.y - center_y) for seat in seats)
+    angle = math.atan2(2 * xy, xx - yy) / 2
+    return math.cos(angle), math.sin(angle)
+
+
+def _bit_is_set(bits: bytes, seat_no: int) -> bool:
+    byte_index, bit_index = divmod(seat_no, 8)
+    return byte_index < len(bits) and bool(bits[byte_index] & (128 >> bit_index))
+
+
+def _url(endpoint: str, query: dict[str, str]) -> str:
+    return f"{endpoint}?{urlencode(query)}"

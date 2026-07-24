@@ -1,0 +1,179 @@
+# piaoxingqiu-auto
+
+票星球余票监控与自动创建订单服务。使用公开库存接口、Playwright、SQLite
+和飞书企业自建应用；程序只创建待支付订单，不执行支付。
+
+## 设计
+
+```text
+piaoxingqiu_auto/
+├── domain/      纯业务规则：运行模型、销售阶段、座位选择、执行结果
+├── platform/    票星球适配：HTTP、认证、库存、页面、选座、订单
+├── runtime/     运行时：浏览器池、单账号购买流程、耗时统计
+├── app/         应用服务：数据库、任务调度、命令、登录、绑定配置
+├── adapters/    外部通道：飞书长连接与消息卡片
+├── config.py    系统配置与数据路径
+└── cli.py       doctor / serve
+```
+
+依赖关系保持清晰：`domain` 不依赖外部实现；`platform` 只依赖领域模型；
+`runtime` 组合领域规则与票星球适配；`app` 编排运行时、数据库和飞书通道；
+`cli` 只负责创建并连接这些组件。
+
+正式服务和诊断入口使用同一套领域规则与运行时代码。项目不包含 Lab、
+benchmark、旧数据库迁移和历史命令兼容层。
+
+## 安装
+
+```powershell
+cd D:\develop\piaoxingqiu-auto
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e .
+python -m playwright install chromium
+python -m piaoxingqiu_auto doctor
+```
+
+Linux：
+
+```bash
+cd /home/zhangyihe2004/piaoxingqiu-auto
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+python -m playwright install chromium
+python -m piaoxingqiu_auto doctor
+```
+
+首次运行会生成：
+
+```text
+~/.piaoxingqiu-auto/config.json
+~/.piaoxingqiu-auto/piaoxingqiu-auto.db
+~/.piaoxingqiu-auto/accounts/
+```
+
+可以通过 `PIAOXINGQIU_AUTO_DIR` 修改运行目录。
+
+## 配置
+
+```json
+{
+  "feishu_app_id": "cli_xxx",
+  "feishu_app_secret": "xxx",
+  "feishu_admin_open_ids": ["ou_xxx"],
+  "feishu_default_chat_id": "oc_xxx",
+  "browser_headless": true,
+  "browser_timeout_seconds": 10,
+  "max_concurrent_accounts": 4,
+  "create_order_enabled": true
+}
+```
+
+## 启动
+
+```bash
+python -m piaoxingqiu_auto doctor
+python -m piaoxingqiu_auto serve
+```
+
+systemd：
+
+```ini
+[Unit]
+Description=Piaoxingqiu Auto
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zhangyihe2004
+WorkingDirectory=/home/zhangyihe2004/piaoxingqiu-auto
+Environment=PIAOXINGQIU_AUTO_DIR=/home/zhangyihe2004/.piaoxingqiu-auto
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/zhangyihe2004/piaoxingqiu-auto/.venv/bin/python -m piaoxingqiu_auto serve
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## 飞书指令
+
+```text
+搜索 <关键词>
+抢票 <搜索序号>
+列表
+详情 <任务ID>
+暂停 <任务ID>
+恢复 <任务ID>
+删除 <任务ID>
+间隔 <任务ID> <秒>
+
+登录
+账号
+删除账号 <账号ID>
+
+绑定 <任务ID> <账号ID>
+启动 <任务ID> <账号ID>
+停止 <任务ID> <账号ID>
+解绑 <任务ID> <账号ID>
+```
+
+登录和绑定配置是分步流程，发送 `取消` 即可退出。
+
+## 工作方式
+
+```text
+任务（一个具体场次）
+└── 绑定（任务 + 账号）
+    ├── 票档优先级
+    ├── 目标数量
+    └── 观演人
+```
+
+- 手机号全局唯一；一个账号可以绑定多个任务，但同一时刻只执行一个。
+- 账号共享登录资料和浏览器缓存；每个绑定独立保存票档、数量、观演人和订单状态。
+- `暂停/恢复` 控制整个任务，`启动/停止` 只控制一个任务与账号的绑定。
+- 删除任务或解绑会保留账号；只有 `删除账号` 才删除登录资料。
+- 回流检测默认 60 秒，最低 10 秒；程序根据官方状态和开售时间自动进入预热、开售或回流阶段。
+
+绑定流程按顺序引导选择票档、数量和票星球账号中已有的观演人。无需实名不选人；
+一单一证选择一位；一票一证选择与目标张数相同的人数。配置只有在发送
+`完成` 后才会通过一个 SQLite 事务整体保存，之后仍需明确发送 `启动`。
+
+选座演出优先用一个票档满足全部数量，其次允许跨票档组合；多人依次选择同排连续、
+同看台紧凑和全场紧凑座位。非选座演出一单只使用一个票档，无法买齐时先购买该票档
+当前能满足的最大数量。套票与优惠价格由票星球确认页计算，程序只选择基础票档和真实
+座位。
+
+## 运行数据
+
+```text
+~/.piaoxingqiu-auto/
+├── config.json
+├── piaoxingqiu-auto.db
+└── accounts/<手机号哈希>/
+    ├── browser-profile/
+    ├── orders/
+    └── artifacts/
+```
+
+手机号不会出现在目录名中。服务日志包含每次执行的库存、页面、选座、观演人和创建响应
+耗时，Linux 可实时查看：
+
+```bash
+journalctl -u piaoxingqiu-auto -f -o cat
+```
+
+## 安全边界
+
+- 创建订单默认由 `create_order_enabled` 总开关控制。
+- 创建请求只放行一次，其他创建请求由防火墙拦截。
+- `CREATED` 和 `UNKNOWN` 状态阻止重复创建。
+- 座位被抢或临时票据失效时，程序刷新实时库存并重新选择。
+- 证件已购时只移除已完成的目标，剩余目标继续等待。
+- 程序不会执行支付。
+- 登录资料和订单保护按账号、任务分别保存。
+- 停止或暂停后，无其他活动任务的浏览器会自动释放。
