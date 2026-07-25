@@ -8,19 +8,16 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlencode
 
 from piaoxingqiu_auto.domain.models import AudienceConfig, required_audience_count
 from piaoxingqiu_auto.domain.seating import Candidate, SeatSelection
-from piaoxingqiu_auto.platform.auth import (
-    AuthGuard,
-    request_context,
-)
+from piaoxingqiu_auto.platform.auth import AuthGuard
 from piaoxingqiu_auto.platform.inventory import GeneralAdmissionSelection, Inventory
 
 
 PRE_ORDER_PATH = "/cyy_gatewayapi/trade/buyer/order/cart/v1/pre_order"
 CREATE_ORDER_PATH = "/cyy_gatewayapi/trade/buyer/order/cart/v1/create_order"
+POSITIONING_PATH = "/cyy_gatewayapi/mcommon/pub/v1/positioning"
 
 
 class CartRejected(RuntimeError):
@@ -221,17 +218,10 @@ class CartClient:
         cached = self.cache.get("location_id")
         if isinstance(cached, str):
             return cached
-        query = urlencode(request_context(self.auth.headers))
-        response = await self.site.page.context.request.get(
-            f"{self.site.origin}/cyy_gatewayapi/mcommon/pub/v1/positioning?{query}",
-            headers=self.auth.headers,
-        )
-        if not response.ok:
-            raise RuntimeError(f"定位接口返回 HTTP {response.status}")
-        payload = await response.json()
-        data = payload.get("data") if isinstance(payload, dict) else None
+        payload = await self._request(POSITIONING_PATH, {})
+        data = payload["data"]
         location_id = str((data or {}).get("locationId") or "")
-        if str(payload.get("statusCode")) != "200" or not location_id:
+        if not location_id:
             raise RuntimeError("定位接口未返回 locationId")
         self.cache["location_id"] = location_id
         return location_id
