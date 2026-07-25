@@ -52,23 +52,32 @@ class SeatSelection:
     candidates: tuple[Candidate, ...]
 
 
-def select_group(
+def select_groups(
     candidates: tuple[Candidate, ...],
     quantity: int,
     plan_caps: dict[str, int] | None = None,
-) -> SeatGroup | None:
-    return _select_spatial_group(candidates, quantity, plan_caps)
+    *,
+    limit: int = 10,
+) -> tuple[SeatGroup, ...]:
+    if quantity < 1 or limit < 1:
+        return ()
+    ranked: list[SeatGroup] = []
+    seen: set[tuple[str, ...]] = set()
 
+    def append(groups: list[SeatGroup]) -> None:
+        for group in _rank_groups(groups, limit - len(ranked)):
+            key = tuple(
+                sorted(candidate.seat.seat_id for candidate in group.candidates)
+            )
+            if key not in seen:
+                seen.add(key)
+                ranked.append(group)
+                if len(ranked) == limit:
+                    return
 
-def _select_spatial_group(
-    candidates: tuple[Candidate, ...],
-    quantity: int,
-    plan_caps: dict[str, int] | None = None,
-) -> SeatGroup | None:
-    continuous = _continuous_groups(candidates, quantity, plan_caps)
-    if continuous:
-        return _random_best(continuous)
-
+    append(_continuous_groups(candidates, quantity, plan_caps))
+    if len(ranked) == limit:
+        return tuple(ranked)
     by_zone: dict[str, list[Candidate]] = {}
     for candidate in candidates:
         by_zone.setdefault(candidate.seat.zone_id, []).append(candidate)
@@ -76,15 +85,24 @@ def _select_spatial_group(
         group
         for zone_candidates in by_zone.values()
         if len(zone_candidates) >= quantity
-        if (
-            group := _compact_group(
-                tuple(zone_candidates), quantity, cohesion=1, plan_caps=plan_caps
-            )
+        for group in _compact_groups(
+            tuple(zone_candidates),
+            quantity,
+            cohesion=1,
+            plan_caps=plan_caps,
         )
     ]
-    if same_zone:
-        return _random_best(same_zone)
-    return _compact_group(candidates, quantity, cohesion=2, plan_caps=plan_caps)
+    append(same_zone)
+    if len(ranked) < limit:
+        append(
+            _compact_groups(
+                candidates,
+                quantity,
+                cohesion=2,
+                plan_caps=plan_caps,
+            )
+        )
+    return tuple(ranked)
 
 
 def _continuous_groups(
@@ -122,15 +140,15 @@ def _append_windows(
             groups.append(SeatGroup(cohesion=0, candidates=candidates))
 
 
-def _compact_group(
+def _compact_groups(
     candidates: tuple[Candidate, ...],
     quantity: int,
     *,
     cohesion: int,
     plan_caps: dict[str, int] | None = None,
-) -> SeatGroup | None:
+) -> list[SeatGroup]:
     if len(candidates) < quantity:
-        return None
+        return []
     groups: dict[tuple[str, ...], SeatGroup] = {}
     for anchor in candidates:
         ordered = heapq.nsmallest(
@@ -153,7 +171,7 @@ def _compact_group(
         nearest = tuple(nearest_list)
         key = tuple(sorted(candidate.seat.seat_id for candidate in nearest))
         groups[key] = SeatGroup(cohesion=cohesion, candidates=nearest)
-    return _random_best(list(groups.values())) if groups else None
+    return list(groups.values())
 
 
 def _within_caps(
@@ -168,9 +186,23 @@ def _within_caps(
     return all(count <= plan_caps.get(plan_id, 0) for plan_id, count in counts.items())
 
 
-def _random_best(groups: list[SeatGroup]) -> SeatGroup:
-    best_score = min(group.score for group in groups)
-    return secrets.choice([group for group in groups if group.score == best_score])
+def _rank_groups(groups: list[SeatGroup], limit: int) -> list[SeatGroup]:
+    by_score: dict[tuple, list[SeatGroup]] = {}
+    for group in groups:
+        by_score.setdefault(group.score, []).append(group)
+    ranked: list[SeatGroup] = []
+    random = secrets.SystemRandom()
+    for score in sorted(by_score):
+        pool = by_score[score]
+        remaining = limit - len(ranked)
+        if remaining <= 0:
+            break
+        if len(pool) > remaining:
+            pool = random.sample(pool, remaining)
+        else:
+            random.shuffle(pool)
+        ranked.extend(pool)
+    return ranked
 
 
 def _distance(left: Seat, right: Seat) -> float:

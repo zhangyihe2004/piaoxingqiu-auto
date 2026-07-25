@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 
 from piaoxingqiu_auto.platform.api import PxqError
@@ -16,7 +16,7 @@ from piaoxingqiu_auto.domain.models import AccountRunConfig, SystemConfig
 from piaoxingqiu_auto.app.database import Database
 from piaoxingqiu_auto.adapters.feishu_gateway import FeishuGateway
 from piaoxingqiu_auto.platform.order_guard import PersistentOrderGuard
-from piaoxingqiu_auto.platform.checkout_page import PurchasePage
+from piaoxingqiu_auto.platform.booking import PurchasePage
 from piaoxingqiu_auto.domain.outcomes import RunResult
 from piaoxingqiu_auto.runtime.order_flow import check_login, run_account
 from piaoxingqiu_auto.domain.sale import (
@@ -33,7 +33,8 @@ from piaoxingqiu_auto.app.tasks import (
 log = logging.getLogger("piaoxingqiu.auto")
 ERROR_ALERT_COOLDOWN = 3600.0
 MAX_BACKOFF_FACTOR = 16
-MAX_CONCURRENT_POLLS = 3
+# 状态轮询不应阻塞真正抢票，但也不让大量任务同时打接口。
+MAX_CONCURRENT_POLLS = 6
 NOTICE_RETRY_SECONDS = 10.0
 
 
@@ -61,6 +62,9 @@ class TaskScheduler:
         self.feishu = feishu
         self.system = system
         self.semaphore = asyncio.Semaphore(system.max_concurrent_accounts)
+        self.login_semaphore = asyncio.Semaphore(
+            min(system.max_concurrent_accounts, 4)
+        )
         self.jobs: dict[int, asyncio.Task] = {}
         self.job_bindings: dict[int, tuple[int, int]] = {}
         self.checks: dict[int, asyncio.Task] = {}
@@ -400,9 +404,7 @@ class TaskScheduler:
         ):
             mapping.pop(task_id, None)
 
-    def _start_binding(
-        self, task_id: int, account_id: int, *, prewarm: bool
-    ) -> None:
+    def _start_binding(self, task_id: int, account_id: int, *, prewarm: bool) -> None:
         if account_id in self.jobs:
             log.debug("账号 #%s 已有执行任务，忽略重复启动", account_id)
             return
@@ -466,12 +468,10 @@ class TaskScheduler:
             await asyncio.gather(check, return_exceptions=True)
         return await self._run_binding(task_id, account_id, prewarm)
 
-    async def _run_binding(
-        self, task_id: int, account_id: int, prewarm: bool
-    ) -> str:
-        async with self.semaphore:
+    async def _run_binding(self, task_id: int, account_id: int, prewarm: bool) -> str:
+        async with _binding_slot(self.semaphore, prewarm):
             log.info(
-                "账号 #%s 获得执行权（%s）",
+                "账号 #%s 开始%s",
                 account_id,
                 "开售预热" if prewarm else "回流抢票",
             )
@@ -505,9 +505,7 @@ class TaskScheduler:
                 return "绑定状态竞争失败"
             try:
                 async with self.browsers.use(account_id, config.browser) as context:
-                    warm = await self.browsers.task_page(
-                        account_id, task_id, context
-                    )
+                    warm = await self.browsers.task_page(account_id, task_id, context)
                     result = await run_account(
                         config,
                         context,
@@ -515,7 +513,8 @@ class TaskScheduler:
                         trace_label=f"任务 #{task['id']}｜账号 #{account_id}",
                         page=warm.page,
                         auth_headers=warm.auth_headers,
-                        page_changed=warm.adopt,
+                        runtime_cache=self.browsers.account_cache(account_id),
+                        execution_gate=self.semaphore if prewarm else None,
                     )
             except asyncio.CancelledError:
                 current = self.db.get_binding(task_id, account_id)
@@ -636,7 +635,7 @@ class TaskScheduler:
             check.add_done_callback(forget_check)
 
     async def _check_account_login(self, account_id: int, task, binding) -> None:
-        async with self.semaphore:
+        async with self.login_semaphore:
             account = self.db.get_account(account_id)
             if (
                 not account
@@ -832,7 +831,9 @@ class TaskScheduler:
             page = await context.new_page()
             site = PurchasePage(page, config)
             try:
-                return await AuthGuard(site).audiences()
+                audiences = await AuthGuard(site).audiences()
+                self.browsers.account_cache(account_id)["audiences"] = audiences
+                return audiences
             finally:
                 with suppress(Exception):
                     await page.close()
@@ -850,3 +851,15 @@ def _protected_order_state(
     if state.status in {"CREATED", "UNKNOWN"}:
         return state.status, state.order_id
     return None
+
+
+@asynccontextmanager
+async def _binding_slot(
+    semaphore: asyncio.Semaphore,
+    defer: bool,
+):
+    if defer:
+        yield
+    else:
+        async with semaphore:
+            yield

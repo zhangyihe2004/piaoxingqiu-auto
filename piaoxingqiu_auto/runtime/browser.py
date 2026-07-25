@@ -27,29 +27,23 @@ class WarmTaskPage:
     page: Page
     auth_headers: dict[str, str] = field(default_factory=dict)
     last_used: float = field(default_factory=time.monotonic)
-    pages: set[Page] = field(default_factory=set)
-
-    def __post_init__(self) -> None:
-        self.pages.add(self.page)
-
-    def adopt(self, page: Page) -> None:
-        self.page = page
-        self.pages.add(page)
-        self.last_used = time.monotonic()
 
 
 async def blank_page(context: BrowserContext, claimed: set[Page] | None = None) -> Page:
     claimed = claimed or set()
-    return next(
-        (
-            page
-            for page in context.pages
-            if page not in claimed
-            and not page.is_closed()
-            and page.url == "about:blank"
-        ),
-        None,
-    ) or await context.new_page()
+    return (
+        next(
+            (
+                page
+                for page in context.pages
+                if page not in claimed
+                and not page.is_closed()
+                and page.url == "about:blank"
+            ),
+            None,
+        )
+        or await context.new_page()
+    )
 
 
 @asynccontextmanager
@@ -105,6 +99,10 @@ class AccountBrowserPool:
         self._managers: dict[int, AbstractAsyncContextManager[BrowserContext]] = {}
         self._contexts: dict[int, BrowserContext] = {}
         self._pages: dict[tuple[int, int], WarmTaskPage] = {}
+        self._cache: dict[int, dict[str, object]] = {}
+
+    def account_cache(self, account_id: int) -> dict[str, object]:
+        return self._cache.setdefault(account_id, {})
 
     @asynccontextmanager
     async def use(
@@ -138,7 +136,7 @@ class AccountBrowserPool:
         for page_key, item in tuple(self._pages.items()):
             if page_key[0] == account_id and item.page.is_closed():
                 self._pages.pop(page_key, None)
-                await self._close_pages(item)
+                await self._close_page(item)
         key = (account_id, task_id)
         warm = self._pages.get(key)
         if warm is not None:
@@ -153,13 +151,10 @@ class AccountBrowserPool:
         if len(account_pages) >= MAX_WARM_PAGES_PER_ACCOUNT:
             old_key, old = min(account_pages, key=lambda pair: pair[1].last_used)
             self._pages.pop(old_key, None)
-            await self._close_pages(old)
+            await self._close_page(old)
 
         claimed = {
-            page
-            for item in self._pages.values()
-            for page in item.pages
-            if not page.is_closed()
+            item.page for item in self._pages.values() if not item.page.is_closed()
         }
         page = await blank_page(context, claimed)
         warm = WarmTaskPage(page)
@@ -171,7 +166,7 @@ class AccountBrowserPool:
         async with lock:
             warm = self._pages.pop((account_id, task_id), None)
             if warm is not None:
-                await self._close_pages(warm)
+                await self._close_page(warm)
 
     async def close(self, account_id: int) -> None:
         lock = self._locks.setdefault(account_id, asyncio.Lock())
@@ -187,16 +182,16 @@ class AccountBrowserPool:
             await self.close(account_id)
 
     def _forget_pages(self, account_id: int) -> None:
+        self._cache.pop(account_id, None)
         for key in tuple(self._pages):
             if key[0] == account_id:
                 self._pages.pop(key, None)
 
     @staticmethod
-    async def _close_pages(warm: WarmTaskPage) -> None:
-        for page in tuple(warm.pages):
-            if not page.is_closed():
-                with suppress(Error):
-                    await page.close()
+    async def _close_page(warm: WarmTaskPage) -> None:
+        if not warm.page.is_closed():
+            with suppress(Error):
+                await warm.page.close()
 
 
 async def save_screenshot(page, directory: Path, name: str) -> Path:

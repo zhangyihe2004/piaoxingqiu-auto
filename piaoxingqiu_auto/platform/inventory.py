@@ -5,7 +5,7 @@ import base64
 import math
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlencode
 
@@ -14,15 +14,21 @@ import geobuf
 from piaoxingqiu_auto.platform.auth import AuthGuard, request_context
 from piaoxingqiu_auto.platform.api import is_success_payload
 from piaoxingqiu_auto.domain.sale import POST_SALE_WAIT_SECONDS, presale_poll_interval
-from piaoxingqiu_auto.domain.seating import Candidate, Seat, SeatSelection, select_group
+from piaoxingqiu_auto.domain.seating import (
+    Candidate,
+    Seat,
+    SeatSelection,
+    select_groups,
+)
 
 if TYPE_CHECKING:
-    from piaoxingqiu_auto.platform.checkout_page import PurchasePage
+    from piaoxingqiu_auto.platform.booking import PurchasePage
 
 
 BATCH_SIZE = 25
-DYNAMIC_CONCURRENCY = 4
-DOWNLOAD_CONCURRENCY = 5
+# 单账号库存请求和全局静态资源下载的独立上限。
+DYNAMIC_CONCURRENCY = 6
+DOWNLOAD_CONCURRENCY = 8
 FAST_STOCK_POLL_SECONDS = 0.25
 FAST_STOCK_WINDOW_SECONDS = 5.0
 STOCK_POLL_SECONDS = 1.0
@@ -31,6 +37,7 @@ STATIC_UNAVAILABLE_CODE = "22024036"
 STATIC_LAYOUT_CACHE_SIZE = 16
 STATIC_RETRY_CACHE_SIZE = 64
 DECODED_RESOURCE_CACHE_SIZE = 64
+SELECTION_QUEUE_SIZE = 10
 T = TypeVar("T")
 
 
@@ -81,6 +88,14 @@ class GeneralAdmissionSelection:
     plan_id: str
     quantity: int
     units: int
+    price: float
+
+
+@dataclass(frozen=True)
+class PlanInventory:
+    caps: dict[str, int]
+    prices: dict[str, float]
+    combos: tuple[dict[str, Any], ...]
 
 
 @dataclass
@@ -144,6 +159,7 @@ class GeneralAdmissionInventory:
                         plan_id=plan_id,
                         quantity=units * unit_qty,
                         units=units,
+                        price=float(item.get("originalPrice") or 0),
                     )
                 )
         if not options:
@@ -289,6 +305,10 @@ class Inventory:
     plan_ids: tuple[str, ...]
     resources: dict[str, str]
     zones: dict[str, tuple[Seat, ...]]
+    selection_queue: tuple[SeatSelection, ...] = ()
+    rejected_seat_ids: set[str] = field(default_factory=set)
+    plan_prices: dict[str, float] = field(default_factory=dict)
+    combo_plans: tuple[dict[str, Any], ...] = ()
 
     @classmethod
     async def open(cls, site: PurchasePage, auth: AuthGuard) -> Inventory:
@@ -298,7 +318,7 @@ class Inventory:
         self,
         quantity: int,
     ) -> SeatSelection:
-        records, plan_caps = await asyncio.gather(
+        records, plan_inventory = await asyncio.gather(
             _timed(
                 self.site,
                 "dynamic",
@@ -314,7 +334,7 @@ class Inventory:
             _timed(
                 self.site,
                 "plan_inventory",
-                _fetch_plan_caps(
+                _fetch_plan_inventory(
                     self.site,
                     self.plan_endpoint,
                     self.common,
@@ -323,6 +343,9 @@ class Inventory:
                 ),
             ),
         )
+        plan_caps = plan_inventory.caps
+        self.plan_prices = plan_inventory.prices
+        self.combo_plans = plan_inventory.combos
         inventories = {
             (rank, plan_name, plan_id): {
                 str(record["zoneConcreteId"]): bits
@@ -359,6 +382,10 @@ class Inventory:
                         )
         if not available:
             raise RuntimeError("动态库存存在，但未能映射到静态座位")
+        for seat_id in self.rejected_seat_ids:
+            available.pop(seat_id, None)
+        if not available:
+            raise InventoryUnavailable("刷新后没有未尝试的可售座位")
         candidates = tuple(available.values())
         counts = {
             plan_id: sum(candidate.plan_id == plan_id for candidate in candidates)
@@ -366,34 +393,123 @@ class Inventory:
         }
         selected_quantity = min(
             quantity,
-            sum(min(plan_caps.get(plan_id, 0), count) for plan_id, count in counts.items()),
+            sum(
+                min(plan_caps.get(plan_id, 0), count)
+                for plan_id, count in counts.items()
+            ),
         )
-        selected = next(
+        queue = next(
             (
-                group
+                queue
                 for current_quantity in range(selected_quantity, 0, -1)
                 if (
-                    group := select_group(candidates, current_quantity, plan_caps)
+                    queue := _selection_queue(
+                        candidates,
+                        current_quantity,
+                        plan_caps,
+                        self.selection_queue,
+                    )
                 )
-                is not None
             ),
-            None,
+            (),
         )
-        if selected is None:
+        if not queue:
             raise RuntimeError("可售座位无法组成有效选择")
+        self.selection_queue = queue
         self.site.record_timing(
             "seat_score", asyncio.get_running_loop().time() - started
         )
-        selected_candidates = tuple(
-            sorted(
-                selected.candidates,
-                key=lambda item: (item.seat.zone_id, item.seat.seat_no),
+        return queue[0]
+
+    def reject(self, selection: SeatSelection) -> None:
+        rejected = {candidate.seat.seat_id for candidate in selection.candidates}
+        self.rejected_seat_ids.update(rejected)
+        self.selection_queue = tuple(
+            queued
+            for queued in self.selection_queue
+            if rejected.isdisjoint(
+                candidate.seat.seat_id for candidate in queued.candidates
             )
         )
-        return SeatSelection(candidates=selected_candidates)
 
     async def wait_available(self, quantity: int) -> SeatSelection:
         return await _wait_inventory(lambda: self.refresh(quantity))
+
+
+def _selection_queue(
+    candidates: tuple[Candidate, ...],
+    quantity: int,
+    plan_caps: dict[str, int],
+    previous: tuple[SeatSelection, ...],
+) -> tuple[SeatSelection, ...]:
+    live = {
+        (candidate.seat.seat_id, candidate.plan_id): candidate
+        for candidate in candidates
+    }
+    queue: list[SeatSelection] = []
+    seen: set[tuple[tuple[str, str], ...]] = set()
+
+    def append(selection: SeatSelection) -> None:
+        key = _selection_key(selection)
+        if key not in seen:
+            seen.add(key)
+            queue.append(selection)
+
+    for selection in previous:
+        if len(selection.candidates) != quantity:
+            continue
+        refreshed = tuple(
+            live.get((candidate.seat.seat_id, candidate.plan_id))
+            for candidate in selection.candidates
+        )
+        refreshed_candidates = tuple(
+            candidate for candidate in refreshed if candidate is not None
+        )
+        if len(refreshed_candidates) == quantity and _within_plan_caps(
+            refreshed_candidates, plan_caps
+        ):
+            append(_selection(refreshed_candidates))
+
+    for group in select_groups(
+        candidates,
+        quantity,
+        plan_caps,
+        limit=SELECTION_QUEUE_SIZE,
+    ):
+        append(_selection(group.candidates))
+        if len(queue) == SELECTION_QUEUE_SIZE:
+            break
+    return tuple(queue)
+
+
+def _selection(candidates: tuple[Candidate, ...]) -> SeatSelection:
+    return SeatSelection(
+        candidates=tuple(
+            sorted(
+                candidates,
+                key=lambda item: (item.seat.zone_id, item.seat.seat_no),
+            )
+        )
+    )
+
+
+def _selection_key(selection: SeatSelection) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        sorted(
+            (candidate.seat.seat_id, candidate.plan_id)
+            for candidate in selection.candidates
+        )
+    )
+
+
+def _within_plan_caps(
+    candidates: tuple[Candidate, ...],
+    plan_caps: dict[str, int],
+) -> bool:
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        counts[candidate.plan_id] = counts.get(candidate.plan_id, 0) + 1
+    return all(count <= plan_caps.get(plan_id, 0) for plan_id, count in counts.items())
 
 
 async def _wait_inventory(load: Callable[[], Awaitable[T]]) -> T:
@@ -465,13 +581,13 @@ async def _fetch_all_dynamic(
     return [record for batch in batches for record in batch]
 
 
-async def _fetch_plan_caps(
+async def _fetch_plan_inventory(
     site: PurchasePage,
     endpoint: str,
     common: dict[str, str],
     headers: dict[str, str],
     plan_ids: tuple[str, ...],
-) -> dict[str, int]:
+) -> PlanInventory:
     query = dict(common, source="FROM_QUICK_ORDER", src="WEB")
     response = await site.page.context.request.get(
         _url(endpoint, query), headers=headers
@@ -481,12 +597,21 @@ async def _fetch_plan_caps(
     data = _response_data(await response.json(), "票档库存接口")
     if not isinstance(data, dict) or not isinstance(data.get("seatPlans"), list):
         raise RuntimeError("票档库存接口缺少 seatPlans 数组")
+    plans = tuple(item for item in data["seatPlans"] if isinstance(item, dict))
     wanted = set(plan_ids)
-    return {
-        str(item.get("seatPlanId")): int(item.get("canBuyCount") or 0)
-        for item in data["seatPlans"]
-        if isinstance(item, dict) and str(item.get("seatPlanId")) in wanted
-    }
+    base = tuple(item for item in plans if str(item.get("seatPlanId") or "") in wanted)
+    return PlanInventory(
+        caps={
+            str(item["seatPlanId"]): int(item.get("canBuyCount") or 0) for item in base
+        },
+        prices={
+            str(item["seatPlanId"]): float(item.get("originalPrice") or 0)
+            for item in base
+        },
+        combos=tuple(
+            item for item in plans if item.get("seatPlanCategory") == "FREE_COMBO"
+        ),
+    )
 
 
 def _plan_bits(record: dict[str, Any], plan_id: str) -> bytes:
@@ -545,9 +670,7 @@ async def _fetch_static_layout(
 ) -> StaticLayout:
     response = await site.page.context.request.get(url)
     if response.status in {401, 429, 469}:
-        raise RuntimeError(
-            f"静态座位接口触发限制（HTTP {response.status}），已停止"
-        )
+        raise RuntimeError(f"静态座位接口触发限制（HTTP {response.status}），已停止")
     if not response.ok:
         raise RuntimeError(f"静态座位接口返回 HTTP {response.status}")
     data = _static_data(await response.json())

@@ -9,7 +9,7 @@ from urllib.parse import urlencode
 from playwright.async_api import Request
 
 if TYPE_CHECKING:
-    from piaoxingqiu_auto.platform.checkout_page import PurchasePage
+    from piaoxingqiu_auto.platform.booking import PurchasePage
 
 
 class AuthenticationError(RuntimeError):

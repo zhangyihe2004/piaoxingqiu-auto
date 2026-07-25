@@ -23,7 +23,7 @@ from piaoxingqiu_auto.domain.sale import (
     sale_time,
     session_sale_time,
 )
-from piaoxingqiu_auto.platform.checkout_page import PurchasePage
+from piaoxingqiu_auto.platform.booking import PurchasePage
 
 
 FAR_POLL_SECONDS = 30.0

@@ -20,7 +20,7 @@ from piaoxingqiu_auto.app.run_config import build_login_config
 from piaoxingqiu_auto.domain.models import SystemConfig
 from piaoxingqiu_auto.app.database import Database
 from piaoxingqiu_auto.adapters.feishu_gateway import FeishuGateway, IncomingCommand
-from piaoxingqiu_auto.platform.checkout_page import PurchasePage
+from piaoxingqiu_auto.platform.booking import PurchasePage
 
 
 SEND_CODE_PATH = "/pub/v5/send_verify_code"

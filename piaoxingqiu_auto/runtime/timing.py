@@ -12,13 +12,7 @@ LABELS = {
     "general_inventory": "票档库存",
     "seat_decode": "座位解码",
     "seat_score": "座位评分",
-    "seat_page": "进入座位图",
-    "seat_map": "选座页",
-    "general_page": "购票页",
-    "confirm_page": "确认页",
-    "audience": "观演人",
-    "submit_click": "提交点击",
-    "create_response": "创建响应",
+    "pre_order": "预下单",
     "create_total": "创建总耗时",
 }
 

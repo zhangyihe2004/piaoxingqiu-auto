@@ -23,7 +23,7 @@ DEFAULT_CONFIG = {
     "feishu_default_chat_id": "",
     "browser_headless": True,
     "browser_timeout_seconds": 10,
-    "max_concurrent_accounts": 3,
+    "max_concurrent_accounts": 4,
     "create_order_enabled": False,
 }
 

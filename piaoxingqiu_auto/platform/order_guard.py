@@ -14,13 +14,11 @@ from playwright.async_api import Request, Route
 
 
 GuardStatus = Literal["READY", "SUBMITTING", "CREATED", "UNKNOWN"]
-GENERAL_CREATE_PATH = "/cyy_gatewayapi/trade/buyer/v1/items/orders/submit"
 CART_CREATE_PATH = "/cyy_gatewayapi/trade/buyer/order/cart/v1/create_order"
-CREATE_PATHS = frozenset({GENERAL_CREATE_PATH, CART_CREATE_PATH})
 
 
 def is_create_url(url: str) -> bool:
-    return urlsplit(url).path.lower() in CREATE_PATHS
+    return urlsplit(url).path.lower() == CART_CREATE_PATH
 
 
 @dataclass
@@ -120,28 +118,19 @@ class OrderFirewall:
         self.armed = False
         self.attempt_allowed = False
         self.blocked_requests = 0
-        self.unexpected_posts: set[str] = set()
 
     async def route(self, route: Route, request: Request) -> None:
-        if request.method.upper() != "POST":
+        if request.method.upper() != "POST" or not is_create_url(request.url):
             await route.continue_()
             return
 
-        if is_create_url(request.url):
-            if self.armed and not self.attempt_allowed:
-                self.attempt_allowed = True
-                await route.continue_()
-                return
-            self.blocked_requests += 1
-            await route.abort("blockedbyclient")
+        if self.armed and not self.attempt_allowed:
+            self.attempt_allowed = True
+            await route.continue_()
             return
 
-        if self.armed:
-            self.unexpected_posts.add(request.url.partition("?")[0])
-            self.blocked_requests += 1
-            await route.abort("blockedbyclient")
-            return
-        await route.continue_()
+        self.blocked_requests += 1
+        await route.abort("blockedbyclient")
 
     def arm_once(self) -> None:
         if self.armed:
