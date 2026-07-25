@@ -9,8 +9,15 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 
 from piaoxingqiu_auto.platform.api import PxqError
-from piaoxingqiu_auto.platform.auth import AuthGuard, OfficialAudience
-from piaoxingqiu_auto.runtime.browser import AccountBrowserPool
+from piaoxingqiu_auto.platform.auth import (
+    AuthGuard,
+    AuthenticationRequired,
+    OfficialAudience,
+)
+from piaoxingqiu_auto.runtime.browser import (
+    MAX_WARM_PAGES_PER_ACCOUNT,
+    AccountBrowserPool,
+)
 from piaoxingqiu_auto.app.run_config import build_login_config, build_order_config
 from piaoxingqiu_auto.domain.models import AccountRunConfig, SystemConfig
 from piaoxingqiu_auto.app.database import Database
@@ -18,7 +25,7 @@ from piaoxingqiu_auto.adapters.feishu_gateway import FeishuGateway
 from piaoxingqiu_auto.platform.order_guard import PersistentOrderGuard
 from piaoxingqiu_auto.platform.booking import PurchasePage
 from piaoxingqiu_auto.domain.outcomes import RunResult
-from piaoxingqiu_auto.runtime.order_flow import check_login, run_account
+from piaoxingqiu_auto.runtime.order_flow import check_login, run_account, warm_account
 from piaoxingqiu_auto.domain.sale import (
     ACTIVE_SESSION_STATUSES,
     PREWARM_SECONDS,
@@ -62,11 +69,10 @@ class TaskScheduler:
         self.feishu = feishu
         self.system = system
         self.semaphore = asyncio.Semaphore(system.max_concurrent_accounts)
-        self.login_semaphore = asyncio.Semaphore(
-            min(system.max_concurrent_accounts, 4)
-        )
+        self.login_semaphore = asyncio.Semaphore(min(system.max_concurrent_accounts, 4))
         self.jobs: dict[int, asyncio.Task] = {}
         self.job_bindings: dict[int, tuple[int, int]] = {}
+        self.warmups: dict[tuple[int, int], asyncio.Task] = {}
         self.checks: dict[int, asyncio.Task] = {}
         self.browsers = AccountBrowserPool()
         self.next_poll: dict[int, float] = {}
@@ -215,14 +221,12 @@ class TaskScheduler:
                     plan["sale_started"] and plan["can_buy_count"] > 0
                     for plan in account_plans
                 )
-                if (
-                    binding["enabled"]
-                    and binding["status"] == "READY"
-                    and (prewarm or (phase == "AVAILABLE" and available))
-                ):
-                    self._start_binding(
-                        task_id, int(binding["account_id"]), prewarm=prewarm
-                    )
+                if binding["enabled"] and binding["status"] == "READY":
+                    account_id = int(binding["account_id"])
+                    if prewarm or (phase == "AVAILABLE" and available):
+                        self._start_binding(task_id, account_id, prewarm=prewarm)
+                    elif phase in {"AVAILABLE", "RESTOCK"}:
+                        self._start_warmup(task_id, account_id)
 
         self._update_stock_notice(task, plans, phase)
         self._schedule_login_checks(task, remaining)
@@ -455,6 +459,80 @@ class TaskScheduler:
 
         job.add_done_callback(forget_job)
 
+    def _start_warmup(self, task_id: int, account_id: int) -> None:
+        key = (task_id, account_id)
+        if (
+            key in self.warmups
+            or self.browsers.has_task_page(account_id, task_id)
+            or self.browsers.task_page_count(account_id)
+            + sum(current[1] == account_id for current in self.warmups)
+            >= MAX_WARM_PAGES_PER_ACCOUNT
+        ):
+            return
+        warmup = asyncio.create_task(
+            self._warm_binding(task_id, account_id),
+            name=f"piaoxingqiu-warmup-{task_id}-{account_id}",
+        )
+        self.warmups[key] = warmup
+
+        def forget(_warmup: asyncio.Task) -> None:
+            if self.warmups.get(key) is _warmup:
+                self.warmups.pop(key, None)
+            with suppress(asyncio.CancelledError):
+                error = _warmup.exception()
+                if error is not None:
+                    log.warning(
+                        "任务 #%s 账号 #%s 回流预热失败：%s",
+                        task_id,
+                        account_id,
+                        error,
+                    )
+
+        warmup.add_done_callback(forget)
+
+    async def _warm_binding(self, task_id: int, account_id: int) -> None:
+        task = self.db.get_task(task_id)
+        account = self.db.get_account(account_id)
+        binding = self.db.get_binding(task_id, account_id)
+        if (
+            not task
+            or task["status"] != "active"
+            or not account
+            or account["status"] != "READY"
+            or not binding
+            or not binding["enabled"]
+            or binding["status"] != "READY"
+        ):
+            return
+        plans = self.db.get_binding_plans(task_id, account_id)
+        people = self.db.get_binding_audiences(task_id, account_id)
+        config = build_order_config(task, plans, people, account, binding, self.system)
+        try:
+            async with self.browsers.use(account_id, config.browser) as context:
+                warm = await self.browsers.task_page(account_id, task_id, context)
+                await warm_account(
+                    config,
+                    page=warm.page,
+                    auth_headers=warm.auth_headers,
+                    runtime_cache=self.browsers.account_cache(account_id),
+                )
+            log.info("任务 #%s 账号 #%s 回流热页面已就绪", task_id, account_id)
+        except AuthenticationRequired as exc:
+            await self.browsers.close_task_page(account_id, task_id)
+            self.db.set_account_status(account_id, "NEEDS_LOGIN", error=str(exc))
+            self._send_notice(
+                task_id,
+                PendingNotice(
+                    f"login:{account_id}",
+                    "账号登录已失效",
+                    f"账号 #{account_id}\n发送：登录",
+                    "orange",
+                ),
+            )
+        except Exception:
+            await self.browsers.close_task_page(account_id, task_id)
+            raise
+
     async def _run_after_check(
         self,
         task_id: int,
@@ -618,6 +696,7 @@ class TaskScheduler:
                 or not binding["enabled"]
                 or binding["status"] != "READY"
                 or account_id in self.jobs
+                or any(key[1] == account_id for key in self.warmups)
                 or account_id in self.checks
                 or now < next_check <= now + interval
             ):
@@ -713,12 +792,15 @@ class TaskScheduler:
             for key in tuple(pending):
                 if key.startswith(f"result:{account_id}:"):
                     pending.pop(key, None)
-        activities = [
-            activity
-            for activity in (self.jobs.get(account_id),)
-            if self.job_bindings.get(account_id) == (task_id, account_id)
-            if activity
-        ]
+        activities = []
+        job = self.jobs.get(account_id)
+        if job is not None and self.job_bindings.get(account_id) == (
+            task_id,
+            account_id,
+        ):
+            activities.append(job)
+        if warmup := self.warmups.pop((task_id, account_id), None):
+            activities.append(warmup)
         if activities:
             log.warning("取消账号 #%s 后台任务：%s", account_id, reason)
         for activity in activities:
@@ -751,9 +833,16 @@ class TaskScheduler:
                     f"result:{account_id}:"
                 ):
                     pending.pop(key, None)
+        warmups = [
+            self.warmups.pop(key) for key in tuple(self.warmups) if key[1] == account_id
+        ]
         activities = [
             activity
-            for activity in (self.jobs.get(account_id), self.checks.get(account_id))
+            for activity in (
+                self.jobs.get(account_id),
+                self.checks.get(account_id),
+                *warmups,
+            )
             if activity
         ]
         if activities:
@@ -808,7 +897,11 @@ class TaskScheduler:
                 self.pending_notices.setdefault(target, {})[key] = notice
 
     async def close(self) -> None:
-        activities = [*self.jobs.values(), *self.checks.values()]
+        activities = [
+            *self.jobs.values(),
+            *self.checks.values(),
+            *self.warmups.values(),
+        ]
         for activity in activities:
             activity.cancel()
         if activities:

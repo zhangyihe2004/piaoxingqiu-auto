@@ -96,6 +96,25 @@ async def run_account(
             await page.unroute(CREATE_ROUTE, route_handler)
 
 
+async def warm_account(
+    config: AccountRunConfig,
+    *,
+    page: Page,
+    auth_headers: dict[str, str],
+    runtime_cache: dict[str, object],
+) -> None:
+    """初始化回流任务页面、账号元数据和选座静态资源。"""
+    site = PurchasePage(page, config)
+    auth = AuthGuard(site, auth_headers)
+    await auth.ensure()
+    await CartClient(site, auth, runtime_cache).warm(config.purchase.audiences)
+    if config.project.support_seat_picking:
+        try:
+            await InventoryBootstrap.open(site, auth).activate(preload=True)
+        except StaticInventoryUnavailable:
+            pass
+
+
 async def _run_account(
     config: AccountRunConfig,
     page: Page,

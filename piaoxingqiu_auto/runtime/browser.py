@@ -104,6 +104,16 @@ class AccountBrowserPool:
     def account_cache(self, account_id: int) -> dict[str, object]:
         return self._cache.setdefault(account_id, {})
 
+    def has_task_page(self, account_id: int, task_id: int) -> bool:
+        warm = self._pages.get((account_id, task_id))
+        return warm is not None and not warm.page.is_closed()
+
+    def task_page_count(self, account_id: int) -> int:
+        return sum(
+            key[0] == account_id and not warm.page.is_closed()
+            for key, warm in self._pages.items()
+        )
+
     @asynccontextmanager
     async def use(
         self, account_id: int, config: BrowserConfig

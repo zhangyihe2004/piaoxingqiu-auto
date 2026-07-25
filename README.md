@@ -150,7 +150,8 @@ WantedBy=multi-user.target
 
 预售任务会在开售前初始化 booking、风控客户端、观演人、定位和静态座位缓存，但不占用
 `max_concurrent_accounts`；官方放行后才申请创建并发名额。日常回流复用账号浏览器、
-认证请求头和账号元数据，命中库存后直接执行 `dynamic → pre_order → create_order`。
+认证请求头和账号元数据；绑定启动后即保留 booking 热页面，命中库存后直接执行
+`dynamic → pre_order → create_order`。每个账号最多保留两个任务热页面。
 
 ## 运行数据
 
