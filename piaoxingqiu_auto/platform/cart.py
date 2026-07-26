@@ -80,20 +80,22 @@ class CartClient:
         audiences: tuple[AudienceConfig, ...],
     ) -> CartOrder:
         show_id, session_id = self.site.booking_ids
-        combo = (
-            _combo_plan(selection, inventory.combo_plans)
+        combos = (
+            _combo_plans(selection, inventory.combo_plans)
             if self.site.config.purchase.real_name_mode == "NONE"
-            else None
+            else {}
         )
         pre_request = (
             _combo_seat_preorder(
                 selection,
-                combo,
+                combos,
+                inventory.plan_prices,
                 show_id,
                 session_id,
                 self._version,
+                self.site.config.purchase.plan_ids,
             )
-            if combo is not None
+            if combos
             else _seat_preorder(
                 selection,
                 inventory.plan_prices,
@@ -108,7 +110,7 @@ class CartClient:
             audiences,
             len(selection.candidates),
             tuple(dict.fromkeys(item.plan for item in selection.candidates)),
-            combo is not None,
+            bool(combos),
         )
 
     async def prepare_general(
@@ -412,41 +414,78 @@ def _general_preorder(
     )
 
 
-def _combo_plan(selection: SeatSelection, plans: tuple[dict, ...]) -> dict | None:
+def _combo_plans(
+    selection: SeatSelection,
+    plans: tuple[dict, ...],
+) -> dict[str, dict]:
     base_ids = {item.plan_id for item in selection.candidates}
-    if len(base_ids) != 1:
-        return None
-    matches = [
-        plan
-        for plan in plans
-        if int(plan.get("unitQty") or 1) == 1
-        and {
-            str(item.get("bizSeatPlanId") or "")
-            for item in plan.get("items", [])
-            if isinstance(item, dict)
-        }
-        == base_ids
-    ]
-    if len(matches) > 1:
-        raise RuntimeError("基础票档对应多个单张套票方案")
-    return matches[0] if matches else None
+    result = {}
+    for base_id in base_ids:
+        matches = [
+            plan
+            for plan in plans
+            if int(plan.get("unitQty") or 1) == 1
+            and {
+                str(item.get("bizSeatPlanId") or "")
+                for item in plan.get("items", [])
+                if isinstance(item, dict)
+            }
+            == {base_id}
+        ]
+        if len(matches) > 1:
+            raise RuntimeError("基础票档对应多个单张套票方案")
+        if matches:
+            result[base_id] = matches[0]
+    return result
 
 
 def _combo_seat_preorder(
     selection: SeatSelection,
-    combo: dict,
+    combos: dict[str, dict],
+    prices: dict[str, float],
     show_id: str,
     session_id: str,
     ver: str,
+    plan_order: tuple[str, ...],
 ) -> dict:
-    base_id = selection.candidates[0].plan_id
-    ticket_ids = iter(_ticket_ids(len(selection.candidates)))
-    group_ids = iter(_ticket_ids(len(selection.candidates)))
-    return _base_request(
-        [
+    grouped: OrderedDict[str, list[Candidate]] = OrderedDict(
+        (plan_id, [])
+        for plan_id in plan_order
+        if any(item.plan_id == plan_id for item in selection.candidates)
+    )
+    for candidate in selection.candidates:
+        grouped[candidate.plan_id].append(candidate)
+    items = []
+    for base_id, candidates in grouped.items():
+        ticket_ids = iter(_ticket_ids(len(candidates)))
+        combo = combos.get(base_id)
+        if combo is None:
+            items.append(
+                {
+                    "sku": {
+                        "qty": len(candidates),
+                        "skuId": base_id,
+                        "skuType": "SINGLE",
+                        "ticketItems": [
+                            {
+                                "seatConcreteId": candidate.seat.seat_id,
+                                "zoneConcreteId": candidate.seat.zone_id,
+                                "id": next(ticket_ids),
+                                "groupId": "default",
+                            }
+                            for candidate in candidates
+                        ],
+                        "ticketPrice": _number(prices[base_id]),
+                    },
+                    "spu": {"sessionId": session_id, "showId": show_id},
+                }
+            )
+            continue
+        group_ids = iter(_ticket_ids(len(candidates)))
+        items.append(
             {
                 "sku": {
-                    "qty": len(selection.candidates),
+                    "qty": len(candidates),
                     "skuId": str(combo["seatPlanId"]),
                     "skuType": "COMBO",
                     "ticketItems": [
@@ -458,15 +497,14 @@ def _combo_seat_preorder(
                             "id": next(ticket_ids),
                             "groupId": "default",
                         }
-                        for candidate in selection.candidates
+                        for candidate in candidates
                     ],
                     "ticketPrice": _number(float(combo.get("originalPrice") or 0)),
                 },
                 "spu": {"sessionId": session_id, "showId": show_id},
             }
-        ],
-        ver,
-    )
+        )
+    return _base_request(items, ver)
 
 
 def _standard_create(
@@ -550,9 +588,10 @@ def _combo_create(
         )
         for item in order["items"]
     ]
-    tickets = [
+    combo_tickets = [
         (ticket, item["spu"], item["sku"]["skuId"])
         for item in order["items"]
+        if item["sku"]["skuType"] == "COMBO"
         for ticket in item["sku"]["ticketItems"]
     ]
     params = []
@@ -572,7 +611,7 @@ def _combo_create(
             "priceDisplay": _price_display(value),
         }
         if price["priceItemType"] == "COMBO_DISCOUNT_FEE":
-            discount = abs(value) / len(tickets)
+            discount = abs(value) / len(combo_tickets)
             param.update(
                 {
                     "applyTickets": [
@@ -588,7 +627,7 @@ def _combo_create(
                                 "sessionId": spu["sessionId"],
                                 "groupId": ticket["groupId"],
                             }
-                            for ticket, spu, sku_id in tickets
+                            for ticket, spu, sku_id in combo_tickets
                         ]
                     ],
                     "tag": "COMBO",
