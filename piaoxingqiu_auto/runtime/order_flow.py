@@ -13,6 +13,7 @@ from playwright.async_api import Page
 
 from piaoxingqiu_auto.domain.models import AccountRunConfig
 from piaoxingqiu_auto.domain.outcomes import RunResult
+from piaoxingqiu_auto.domain.sale import SaleUnavailable
 from piaoxingqiu_auto.domain.seating import SeatSelection
 from piaoxingqiu_auto.platform.auth import AuthGuard, AuthenticationRequired
 from piaoxingqiu_auto.platform.cart import CartClient, CartOrder, CartRejected
@@ -33,7 +34,6 @@ from piaoxingqiu_auto.platform.order_response import (
     find_already_purchased_ids,
     match_configured_ids,
 )
-from piaoxingqiu_auto.platform.sale_gate import SaleGate, SaleUnavailable
 from piaoxingqiu_auto.runtime.browser import blank_page, save_screenshot
 from piaoxingqiu_auto.runtime.timing import RunTimings
 
@@ -55,6 +55,8 @@ async def run_account(
     auth_headers: dict[str, str] | None = None,
     runtime_cache: dict[str, object] | None = None,
     execution_gate: asyncio.Semaphore | None = None,
+    sale_signal: Awaitable[None] | None = None,
+    prewarm_remaining: float | None = None,
 ) -> RunResult:
     """执行一个账号的一次自动抢票生命周期，最多创建一个订单。"""
     if not config.create_order:
@@ -86,6 +88,8 @@ async def run_account(
             auth_headers=auth_headers,
             runtime_cache=runtime_cache,
             acquire_execution=acquire_execution,
+            sale_signal=sale_signal,
+            prewarm_remaining=prewarm_remaining,
         )
     finally:
         if slot_acquired:
@@ -126,12 +130,16 @@ async def _run_account(
     auth_headers: dict[str, str] | None,
     runtime_cache: dict[str, object] | None,
     acquire_execution: Callable[[], Awaitable[None]],
+    sale_signal: Awaitable[None] | None,
+    prewarm_remaining: float | None,
 ) -> RunResult:
     timings = RunTimings(trace_label or config.project.name)
     site = PurchasePage(page, config, timings.record)
     guard = PersistentOrderGuard(config.state_path, config.plan_key)
     guard.require_ready()
     auth = AuthGuard(site, auth_headers)
+    if prewarm:
+        auth.suspend_validation()
     try:
         await auth.ensure()
     except AuthenticationRequired:
@@ -155,6 +163,8 @@ async def _run_account(
                 ticket_quantity,
                 prewarm,
                 acquire_execution,
+                sale_signal,
+                prewarm_remaining,
             )
             selection, prepared = await _prepare_seats(
                 cart,
@@ -169,7 +179,8 @@ async def _run_account(
         else:
             if prewarm:
                 await cart.warm(people)
-                await _wait_sale(site, auth)
+                await site.prepare_booking()
+                await _wait_sale(sale_signal)
             await acquire_execution()
             general_source = GeneralAdmissionInventory.open(site, auth)
             timings.begin(1)
@@ -433,38 +444,31 @@ async def _prepare_seat_selection(
     quantity: int,
     prewarm: bool,
     acquire_execution: Callable[[], Awaitable[None]],
+    sale_signal: Awaitable[None] | None,
+    prewarm_remaining: float | None,
 ) -> tuple[Inventory, SeatSelection]:
     source: Inventory | None = None
     bootstrap: InventoryBootstrap | None = None
     if prewarm:
         await cart.warm(site.config.purchase.audiences)
-        gate = SaleGate(site)
-        sale = await gate.fetch()
-        if not sale.on_sale:
-            sale = await gate.wait_until_prewarm(sale, auth)
-            bootstrap = InventoryBootstrap.open(site, auth)
-            if not sale.on_sale:
-                await site.prepare_booking()
-                static_task = asyncio.create_task(
-                    bootstrap.wait_static(
-                        remaining_seconds=sale.remaining_seconds,
-                        preload=True,
-                    )
-                )
-                try:
-                    sale = await gate.wait_until_sale(sale, auth)
-                    source = (
-                        await static_task
-                        if static_task.done()
-                        else await bootstrap.wait_static(
-                            remaining_seconds=sale.remaining_seconds
-                        )
-                    )
-                finally:
-                    if not static_task.done():
-                        static_task.cancel()
-                        await asyncio.gather(static_task, return_exceptions=True)
-        bootstrap = bootstrap or InventoryBootstrap.open(site, auth)
+        bootstrap = InventoryBootstrap.open(site, auth)
+        await site.prepare_booking()
+        static_task = asyncio.create_task(
+            bootstrap.wait_static(
+                remaining_seconds=prewarm_remaining,
+                preload=True,
+            )
+        )
+        try:
+            await _wait_sale(sale_signal)
+            try:
+                source = await static_task
+            except StaticInventoryUnavailable:
+                source = await bootstrap.wait_static()
+        finally:
+            if not static_task.done():
+                static_task.cancel()
+                await asyncio.gather(static_task, return_exceptions=True)
 
     await acquire_execution()
     timings.begin(1)
@@ -555,14 +559,10 @@ async def _prepare_cart(
     raise AssertionError("unreachable")
 
 
-async def _wait_sale(site: PurchasePage, auth: AuthGuard) -> None:
-    gate = SaleGate(site)
-    sale = await gate.fetch()
-    if not sale.on_sale:
-        sale = await gate.wait_until_prewarm(sale, auth)
-        if not sale.on_sale:
-            await site.prepare_booking()
-            await gate.wait_until_sale(sale, auth)
+async def _wait_sale(signal: Awaitable[None] | None) -> None:
+    if signal is None:
+        raise SaleUnavailable("缺少任务级开售观察器")
+    await asyncio.shield(signal)
 
 
 async def _create_once(

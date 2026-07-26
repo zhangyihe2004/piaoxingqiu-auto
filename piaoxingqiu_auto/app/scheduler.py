@@ -28,8 +28,14 @@ from piaoxingqiu_auto.domain.outcomes import RunResult
 from piaoxingqiu_auto.runtime.order_flow import check_login, run_account, warm_account
 from piaoxingqiu_auto.domain.sale import (
     ACTIVE_SESSION_STATUSES,
+    OPEN_SESSION_STATUSES,
+    POST_SALE_WAIT_SECONDS,
     PREWARM_SECONDS,
+    SaleUnavailable,
+    find_session,
+    presale_poll_interval,
     sale_phase,
+    sale_time,
 )
 from piaoxingqiu_auto.app.tasks import (
     SessionUnavailable,
@@ -43,6 +49,7 @@ MAX_BACKOFF_FACTOR = 16
 # 状态轮询不应阻塞真正抢票，但也不让大量任务同时打接口。
 MAX_CONCURRENT_POLLS = 6
 NOTICE_RETRY_SECONDS = 10.0
+LOGIN_CHECK_INTERVAL = 15 * 60
 
 
 @dataclass(frozen=True)
@@ -74,6 +81,7 @@ class TaskScheduler:
         self.job_bindings: dict[int, tuple[int, int]] = {}
         self.warmups: dict[tuple[int, int], asyncio.Task] = {}
         self.checks: dict[int, asyncio.Task] = {}
+        self.sale_watchers: dict[int, asyncio.Task[None]] = {}
         self.browsers = AccountBrowserPool()
         self.next_poll: dict[int, float] = {}
         self.next_auth: dict[int, float] = {}
@@ -209,6 +217,7 @@ class TaskScheduler:
             )
             self.phases[task_id] = phase
         prewarm = phase == "PREWARM"
+        sale_signal: asyncio.Task[None] | None = None
         if self.system.create_order_enabled:
             for binding in self.db.list_bindings(task_id=task_id):
                 account = self.db.get_account(binding["account_id"])
@@ -224,11 +233,19 @@ class TaskScheduler:
                 if binding["enabled"] and binding["status"] == "READY":
                     account_id = int(binding["account_id"])
                     if prewarm or (phase == "AVAILABLE" and available):
-                        self._start_binding(task_id, account_id, prewarm=prewarm)
+                        if prewarm and sale_signal is None:
+                            sale_signal = self._ensure_sale_watcher(task)
+                        self._start_binding(
+                            task_id,
+                            account_id,
+                            prewarm=prewarm,
+                            sale_signal=sale_signal,
+                            prewarm_remaining=remaining,
+                        )
                     elif phase in {"AVAILABLE", "RESTOCK"}:
                         self._start_warmup(task_id, account_id)
 
-        self._update_stock_notice(task, plans, phase)
+        self._update_stock_notice(task, plans, phase, previous_phase)
         self._schedule_login_checks(task, remaining)
 
     async def _pause_task(self, task, key: str, reason: str) -> None:
@@ -265,9 +282,18 @@ class TaskScheduler:
         if failures >= 5:
             self._alert_poll_error(task, failures, exc)
 
-    def _update_stock_notice(self, task, plans, phase: str) -> None:
+    def _update_stock_notice(
+        self,
+        task,
+        plans,
+        phase: str,
+        previous_phase: str | None,
+    ) -> None:
         task_id = int(task["id"])
         current = self._available_plan_ids(task_id, plans, phase)
+        if previous_phase == "PREWARM" and phase == "AVAILABLE":
+            self.available_plans[task_id] = current
+            return
         added = current - self.available_plans[task_id]
         if not added:
             self.available_plans[task_id] = current
@@ -374,10 +400,93 @@ class TaskScheduler:
         if notice.error_alert:
             self.last_error_alert[task_id] = time.monotonic()
 
+    def _ensure_sale_watcher(self, task) -> asyncio.Task[None]:
+        task_id = int(task["id"])
+        current = self.sale_watchers.get(task_id)
+        if current is not None and not current.done():
+            return current
+        watcher = asyncio.create_task(
+            self._observe_sale(task_id),
+            name=f"piaoxingqiu-sale-{task_id}",
+        )
+        self.sale_watchers[task_id] = watcher
+
+        def finish(completed: asyncio.Task[None]) -> None:
+            if self.sale_watchers.get(task_id) is completed:
+                self.sale_watchers.pop(task_id, None)
+            task = self.db.get_task(task_id)
+            if task and task["status"] == "active":
+                self.next_poll[task_id] = 0
+            else:
+                self.next_poll.pop(task_id, None)
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                return
+            except SaleUnavailable as exc:
+                log.info("抢票任务 #%s 开售观察结束：%s", task_id, exc)
+            except Exception:
+                log.exception("抢票任务 #%s 开售观察异常", task_id)
+            else:
+                log.info("抢票任务 #%s 官方已开放，释放全部预热账号", task_id)
+
+        watcher.add_done_callback(finish)
+        return watcher
+
+    async def _observe_sale(self, task_id: int) -> None:
+        failures = 0
+        while True:
+            task = self.db.get_task(task_id)
+            if not task or task["status"] != "active":
+                raise SaleUnavailable("任务已停止")
+            try:
+                sessions, server_time_ms = (
+                    await self.service.client.quick_order_sessions_timed(
+                        str(task["show_id"])
+                    )
+                )
+                session = find_session(sessions, str(task["session_id"]))
+                if session is None:
+                    raise SaleUnavailable("目标场次已从官方场次列表移除")
+                status = str(session.get("sessionStatus") or "").upper()
+                if status in OPEN_SESSION_STATUSES:
+                    return
+                if status != "PENDING":
+                    raise SaleUnavailable(f"官方场次状态为 {status or 'MISSING'}")
+                sale_time_ms = sale_time(session)
+                if sale_time_ms is None:
+                    raise SaleUnavailable("官方场次未提供开售时间")
+                remaining = (sale_time_ms - server_time_ms) / 1000
+                if remaining > PREWARM_SECONDS:
+                    raise SaleUnavailable("官方开售时间已调整到预热窗口之外")
+                if remaining < -POST_SALE_WAIT_SECONDS:
+                    raise SaleUnavailable("官方未在开售等待窗口内开放")
+                failures = 0
+                await asyncio.sleep(presale_poll_interval(remaining))
+            except (SaleUnavailable, asyncio.CancelledError):
+                raise
+            except Exception as exc:
+                failures += 1
+                if failures >= 5:
+                    raise SaleUnavailable(
+                        "开售观察连续 5 次请求失败，已交回日常轮询"
+                    ) from exc
+                log.warning(
+                    "抢票任务 #%s 开售观察请求失败（%s/5），继续等待",
+                    task_id,
+                    failures,
+                    exc_info=True,
+                )
+                await asyncio.sleep(1)
+
     def _schedule_next(self, task_id: int) -> None:
         task = self.db.get_task(task_id)
         if not task or task["status"] != "active":
             self._clear_runtime_state(task_id)
+            return
+        watcher = self.sale_watchers.get(task_id)
+        if watcher is not None and not watcher.done():
+            self.next_poll[task_id] = float("inf")
             return
         delay = float(task["interval_sec"])
         delay *= min(2 ** self.failures.get(task_id, 0), MAX_BACKOFF_FACTOR)
@@ -397,6 +506,8 @@ class TaskScheduler:
         ):
             for task_id in set(mapping) - active_ids:
                 mapping.pop(task_id, None)
+        for task_id in set(self.sale_watchers) - active_ids:
+            self.sale_watchers.pop(task_id).cancel()
 
     def _clear_runtime_state(self, task_id: int) -> None:
         for mapping in (
@@ -407,16 +518,31 @@ class TaskScheduler:
             self.phases,
         ):
             mapping.pop(task_id, None)
+        if watcher := self.sale_watchers.pop(task_id, None):
+            watcher.cancel()
 
-    def _start_binding(self, task_id: int, account_id: int, *, prewarm: bool) -> None:
+    def _start_binding(
+        self,
+        task_id: int,
+        account_id: int,
+        *,
+        prewarm: bool,
+        sale_signal: asyncio.Task[None] | None = None,
+        prewarm_remaining: float | None = None,
+    ) -> None:
         if account_id in self.jobs:
             log.debug("账号 #%s 已有执行任务，忽略重复启动", account_id)
             return
         mode = "开售预热" if prewarm else "回流抢票"
         log.info("任务 #%s 账号 #%s 已加入执行队列（%s）", task_id, account_id, mode)
         job = asyncio.create_task(
-            self._run_after_check(
-                task_id, account_id, prewarm, self.checks.get(account_id)
+            self._run_binding(
+                task_id,
+                account_id,
+                prewarm,
+                self.checks.get(account_id),
+                sale_signal,
+                prewarm_remaining,
             ),
             name=(
                 f"piaoxingqiu-binding-{task_id}-{account_id}-"
@@ -533,20 +659,19 @@ class TaskScheduler:
             await self.browsers.close_task_page(account_id, task_id)
             raise
 
-    async def _run_after_check(
+    async def _run_binding(
         self,
         task_id: int,
         account_id: int,
         prewarm: bool,
         check: asyncio.Task | None,
+        sale_signal: asyncio.Task[None] | None,
+        prewarm_remaining: float | None,
     ) -> str:
         if check:
             log.info("账号 #%s 启动抢票前取消正在进行的登录检查", account_id)
             check.cancel()
             await asyncio.gather(check, return_exceptions=True)
-        return await self._run_binding(task_id, account_id, prewarm)
-
-    async def _run_binding(self, task_id: int, account_id: int, prewarm: bool) -> str:
         async with _binding_slot(self.semaphore, prewarm):
             log.info(
                 "账号 #%s 开始%s",
@@ -593,6 +718,8 @@ class TaskScheduler:
                         auth_headers=warm.auth_headers,
                         runtime_cache=self.browsers.account_cache(account_id),
                         execution_gate=self.semaphore if prewarm else None,
+                        sale_signal=sale_signal,
+                        prewarm_remaining=prewarm_remaining,
                     )
             except asyncio.CancelledError:
                 current = self.db.get_binding(task_id, account_id)
@@ -682,9 +809,8 @@ class TaskScheduler:
             return result.status
 
     def _schedule_login_checks(self, task, remaining: float | None) -> None:
-        interval = AuthGuard.interval(
-            remaining if remaining is not None else float("inf")
-        )
+        if remaining is not None and abs(remaining) <= PREWARM_SECONDS:
+            return
         now = time.monotonic()
         for binding in self.db.list_bindings(task_id=task["id"]):
             account_id = int(binding["account_id"])
@@ -698,10 +824,10 @@ class TaskScheduler:
                 or account_id in self.jobs
                 or any(key[1] == account_id for key in self.warmups)
                 or account_id in self.checks
-                or now < next_check <= now + interval
+                or now < next_check <= now + LOGIN_CHECK_INTERVAL
             ):
                 continue
-            self.next_auth[account_id] = now + interval
+            self.next_auth[account_id] = now + LOGIN_CHECK_INTERVAL
             check = asyncio.create_task(
                 self._check_account_login(account_id, task, binding)
             )
@@ -901,6 +1027,7 @@ class TaskScheduler:
             *self.jobs.values(),
             *self.checks.values(),
             *self.warmups.values(),
+            *self.sale_watchers.values(),
         ]
         for activity in activities:
             activity.cancel()

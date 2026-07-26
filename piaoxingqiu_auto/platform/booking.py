@@ -4,17 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Awaitable, Callable
-from typing import TypeVar
+from collections.abc import Callable
 from urllib.parse import parse_qs, urlsplit
 
-from playwright.async_api import Page, Request
+from playwright.async_api import Page
 
 from piaoxingqiu_auto.domain.models import AccountRunConfig
 
 
 POLL_INTERVAL_MS = 250
-T = TypeVar("T")
 
 
 class PurchasePage:
@@ -39,10 +37,6 @@ class PurchasePage:
             self._session_id and not re.fullmatch(r"[0-9a-fA-F]{24}", self._session_id)
         ):
             raise RuntimeError("booking_url 缺少有效 showId 或 saleShowSessionId")
-
-    @property
-    def show_id(self) -> str:
-        return self._show_id
 
     @property
     def origin(self) -> str:
@@ -71,7 +65,11 @@ class PurchasePage:
                 self.config.project.booking_url,
                 wait_until="domcontentloaded",
             )
-        await _check_request(await request_info.value, "票档")
+        response = await (await request_info.value).response()
+        if response is None:
+            raise RuntimeError("票档请求未返回响应")
+        if not response.ok:
+            raise RuntimeError(f"票档接口返回 HTTP {response.status}")
 
     async def prepare_booking(self) -> None:
         current = urlsplit(self.page.url)
@@ -81,8 +79,20 @@ class PurchasePage:
             or session_id != self._session_id
         ):
             await self.open_purchase()
-        if await self._poll(self._client_loaded) is None:
-            raise RuntimeError("booking 主模块未加载")
+        deadline = (
+            asyncio.get_running_loop().time() + self.config.browser.timeout_ms / 1000
+        )
+        while asyncio.get_running_loop().time() < deadline:
+            if await self.page.evaluate(
+                """
+                () => performance.getEntriesByType("resource").some(
+                  entry => /\\/index-[^/]+\\.js(?:\\?|$)/.test(entry.name)
+                )
+                """
+            ):
+                return
+            await self.page.wait_for_timeout(POLL_INTERVAL_MS)
+        raise RuntimeError("booking 主模块未加载")
 
     async def reusable_task_page(self) -> bool:
         if self.page.is_closed():
@@ -100,34 +110,3 @@ class PurchasePage:
     def record_timing(self, stage: str, seconds: float) -> None:
         if self._timing is not None:
             self._timing(stage, seconds)
-
-    async def _client_loaded(self) -> bool | None:
-        loaded = await self.page.evaluate(
-            """
-            () => performance.getEntriesByType("resource").some(
-              entry => /\\/index-[^/]+\\.js(?:\\?|$)/.test(entry.name)
-            )
-            """
-        )
-        return True if loaded else None
-
-    async def _poll(
-        self,
-        finder: Callable[[], Awaitable[T | None]],
-    ) -> T | None:
-        deadline = (
-            asyncio.get_running_loop().time() + self.config.browser.timeout_ms / 1000
-        )
-        while asyncio.get_running_loop().time() < deadline:
-            if result := await finder():
-                return result
-            await self.page.wait_for_timeout(POLL_INTERVAL_MS)
-        return None
-
-
-async def _check_request(request: Request, label: str) -> None:
-    response = await request.response()
-    if response is None:
-        raise RuntimeError(f"{label}请求未返回响应")
-    if not response.ok:
-        raise RuntimeError(f"{label}接口返回 HTTP {response.status}")

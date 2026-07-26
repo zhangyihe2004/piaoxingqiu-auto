@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+from email.utils import parsedate_to_datetime
 from typing import Any, TypeGuard
 
 import httpx
@@ -42,7 +44,11 @@ class PxqClient:
     async def aclose(self) -> None:
         await self._http.aclose()
 
-    async def _get(self, path: str, params: dict | None = None) -> Any:
+    async def _get_response(
+        self,
+        path: str,
+        params: dict | None = None,
+    ) -> tuple[Any, httpx.Response]:
         resp = await self._http.get(BASE_URL + path, params=params)
         resp.raise_for_status()
         payload = resp.json()
@@ -61,10 +67,10 @@ class PxqClient:
                 status_code=status_code,
                 comments=comments,
             )
-        return payload.get("data")
+        return payload.get("data"), resp
 
     async def _get_object(self, path: str, params: dict | None = None) -> dict:
-        data = await self._get(path, params)
+        data, _ = await self._get_response(path, params)
         if not isinstance(data, dict):
             raise PxqError(f"{path} -> 响应缺少 data 对象")
         return data
@@ -94,17 +100,30 @@ class PxqClient:
 
     async def quick_order_sessions(self, show_id: str) -> list[dict]:
         """快速购票场次：场次、开售状态及是否支持选座。"""
+        sessions, _ = await self.quick_order_sessions_timed(show_id)
+        return sessions
+
+    async def quick_order_sessions_timed(
+        self,
+        show_id: str,
+    ) -> tuple[list[dict], int]:
+        """快速购票场次以及票星球响应时间。"""
         path = f"/show/pub/v5/show/{show_id}/sessions"
-        data = await self._get(path, {"source": "FROM_QUICK_ORDER", "src": "WEB"})
+        data, response = await self._get_response(
+            path,
+            {"source": "FROM_QUICK_ORDER", "src": "WEB"},
+        )
         if not isinstance(data, list) or not all(
             isinstance(item, dict) for item in data
         ):
             raise PxqError(f"{path} -> 响应缺少 data 数组")
-        return data
-
-    async def show_dynamic(self, show_id: str) -> dict:
-        """演出动态信息：包含官方开售时间与演出状态。"""
-        return await self._get_object(f"/show/pub/v5/show/{show_id}/dynamic")
+        try:
+            server_time = int(
+                parsedate_to_datetime(response.headers["date"]).timestamp() * 1000
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            server_time = int(time.time() * 1000)
+        return data, server_time
 
     async def show_static(self, show_id: str) -> dict:
         """演出静态信息：包含购票须知与实名规则。"""

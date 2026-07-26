@@ -11,8 +11,8 @@ from piaoxingqiu_auto.app.database import Database
 from piaoxingqiu_auto.domain.sale import (
     MIN_INTERVAL,
     MISSING_SESSION_STATUS,
+    OPEN_SESSION_STATUSES,
     sale_time,
-    session_sale_time,
 )
 
 
@@ -120,15 +120,7 @@ class TaskService:
         return parse_real_name_mode(await self.client.show_static(show_id))
 
     async def show_sessions(self, show_id: str) -> tuple[str, list[dict]]:
-        sessions, dynamic = await asyncio.gather(
-            self.client.quick_order_sessions(show_id),
-            self.client.show_dynamic(show_id),
-        )
-        for session in sessions:
-            if session_time := session_sale_time(
-                dynamic, str(session.get("bizShowSessionId") or "")
-            ) or sale_time(session):
-                session["_sale_time_ms"] = session_time
+        sessions = await self.client.quick_order_sessions(show_id)
         show_name = str(sessions[0].get("showName") or show_id) if sessions else show_id
         return show_name, sessions
 
@@ -164,7 +156,7 @@ class TaskService:
             session_status=str(
                 session.get("sessionStatus") or MISSING_SESSION_STATUS
             ).upper(),
-            sale_time_ms=session.get("_sale_time_ms") or sale_time(session),
+            sale_time_ms=sale_time(session),
             plans=plans,
         )
         return task_id, created
@@ -172,46 +164,36 @@ class TaskService:
         self,
         task,
         sessions_task: Awaitable[list[dict]] | None = None,
-    ) -> tuple[str, int | None, list[tuple[str, int, bool]]]:
+    ) -> tuple[str, int | None, list[tuple[str, int, bool]] | None]:
         show_id, session_id = task["show_id"], task["session_id"]
-        plans_task = asyncio.create_task(
-            self.client.quick_order_plans(show_id, session_id)
+        sessions = await (
+            sessions_task or self.client.quick_order_sessions(show_id)
         )
-        try:
-            sessions = await (
-                sessions_task or self.client.quick_order_sessions(show_id)
-            )
-            session = next(
-                (
-                    item
-                    for item in sessions
-                    if item.get("bizShowSessionId") == session_id
-                ),
-                None,
-            )
-            if session is None:
-                raise SessionUnavailable("目标场次已从公开接口移除")
-            session_status = str(
-                session.get("sessionStatus") or MISSING_SESSION_STATUS
-            ).upper()
-            sale_time_ms = sale_time(session)
-            if session_status == "PENDING" and sale_time_ms is None:
-                sale_time_ms = session_sale_time(
-                    await self.client.show_dynamic(show_id), session_id
-                )
-            plans = await plans_task
-        finally:
-            if not plans_task.done():
-                plans_task.cancel()
-            await asyncio.gather(plans_task, return_exceptions=True)
-        snapshot = [
+        session = next(
             (
-                str(item["seatPlanId"]),
-                int(item.get("canBuyCount") or 0),
-                bool(item.get("saleStarted")),
-            )
-            for item in plans["seatPlans"]
-        ]
+                item
+                for item in sessions
+                if item.get("bizShowSessionId") == session_id
+            ),
+            None,
+        )
+        if session is None:
+            raise SessionUnavailable("目标场次已从公开接口移除")
+        session_status = str(
+            session.get("sessionStatus") or MISSING_SESSION_STATUS
+        ).upper()
+        sale_time_ms = sale_time(session)
+        snapshot = None
+        if session_status in OPEN_SESSION_STATUSES:
+            plans = await self.client.quick_order_plans(show_id, session_id)
+            snapshot = [
+                (
+                    str(item["seatPlanId"]),
+                    int(item.get("canBuyCount") or 0),
+                    bool(item.get("saleStarted")),
+                )
+                for item in plans["seatPlans"]
+            ]
         return (
             session_status,
             sale_time_ms,

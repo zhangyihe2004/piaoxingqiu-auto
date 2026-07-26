@@ -20,6 +20,10 @@ ACTIVE_SESSION_STATUSES = OPEN_SESSION_STATUSES | {
 }
 
 
+class SaleUnavailable(RuntimeError):
+    pass
+
+
 def sale_phase(task, plans, now_ms: int | None = None) -> str:
     """Return the internal phase derived from the official sessionStatus."""
     status = str(task["session_status"] or "").upper()
@@ -55,15 +59,6 @@ def sale_time(value: Any) -> int | None:
         if isinstance(item, (int, float)) and item > 1_000_000_000_000
     }
     return candidates.pop() if len(candidates) == 1 else None
-
-
-def session_sale_time(value: Any, session_id: str) -> int | None:
-    matches = [
-        item
-        for item in _walk_dicts(value)
-        if str(item.get("bizShowSessionId") or "") == session_id
-    ]
-    return sale_time(matches)
 
 
 def find_session(value: Any, session_id: str) -> dict[str, Any] | None:

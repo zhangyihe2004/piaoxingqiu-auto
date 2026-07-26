@@ -239,7 +239,7 @@ class Database:
         task_id: int,
         session_status: str,
         sale_time_ms: int | None,
-        plans: list[tuple[str, int, bool]],
+        plans: list[tuple[str, int, bool]] | None,
     ) -> bool:
         now = time.time()
         self.connection.execute("BEGIN IMMEDIATE")
@@ -257,25 +257,26 @@ class Database:
             if not changed:
                 self.connection.rollback()
                 return False
-            self.connection.execute(
-                """
-                UPDATE task_plans
-                SET can_buy_count = 0, sale_started = 0, updated_at = ?
-                WHERE task_id = ?
-                """,
-                (now, task_id),
-            )
-            self.connection.executemany(
-                """
-                UPDATE task_plans
-                SET can_buy_count = ?, sale_started = ?, updated_at = ?
-                WHERE task_id = ? AND seat_plan_id = ?
-                """,
-                [
-                    (count, int(started), now, task_id, plan_id)
-                    for plan_id, count, started in plans
-                ],
-            )
+            if plans is not None:
+                self.connection.execute(
+                    """
+                    UPDATE task_plans
+                    SET can_buy_count = 0, sale_started = 0, updated_at = ?
+                    WHERE task_id = ?
+                    """,
+                    (now, task_id),
+                )
+                self.connection.executemany(
+                    """
+                    UPDATE task_plans
+                    SET can_buy_count = ?, sale_started = ?, updated_at = ?
+                    WHERE task_id = ? AND seat_plan_id = ?
+                    """,
+                    [
+                        (count, int(started), now, task_id, plan_id)
+                        for plan_id, count, started in plans
+                    ],
+                )
             self.connection.commit()
             return True
         except Exception:

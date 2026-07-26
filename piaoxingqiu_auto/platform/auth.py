@@ -11,7 +11,6 @@ from playwright.async_api import Request
 if TYPE_CHECKING:
     from piaoxingqiu_auto.platform.booking import PurchasePage
 
-
 class AuthenticationError(RuntimeError):
     pass
 
@@ -36,36 +35,42 @@ class AuthGuard:
         self.site = site
         self.headers = headers if headers is not None else {}
         self._verified_at = 0.0
+        self._validation_suspended = False
         root = f"{site.origin}/cyy_gatewayapi/show"
-        self.endpoint = f"{root}/buyer/v5/show/{site.show_id}/show_user"
+        self.endpoint = f"{root}/buyer/v5/show/{site.booking_ids[0]}/show_user"
+
+    def suspend_validation(self) -> None:
+        self._validation_suspended = True
 
     async def ensure(self) -> None:
+        if self._validation_suspended:
+            if not self.headers:
+                await self._capture()
+            return
         if self.headers and await self.check():
             return
         await self.refresh()
 
     async def refresh(self) -> None:
+        await self._capture()
+        if not await self.check():
+            raise AuthenticationRequired("登录状态无效，请通过飞书重新登录")
+
+    async def _capture(self) -> None:
         try:
             headers = await capture_authenticated_headers(self.site)
         except AuthenticationRequired:
             raise AuthenticationRequired("登录状态无效，请通过飞书重新登录") from None
         self.headers.clear()
         self.headers.update(headers)
-        if not await self.check():
-            raise AuthenticationRequired("登录状态无效，请通过飞书重新登录")
-
-    async def require_valid(self, *, allow_refresh: bool) -> None:
-        if await self.check():
-            return
-        if allow_refresh:
-            await self.refresh()
-            return
-        raise AuthenticationRequired("登录状态失效，请通过飞书重新登录")
 
     async def require_recent(self, max_age: float = 5.0) -> None:
+        if self._validation_suspended:
+            return
         if asyncio.get_running_loop().time() - self._verified_at <= max_age:
             return
-        await self.require_valid(allow_refresh=False)
+        if not await self.check():
+            raise AuthenticationRequired("登录状态失效，请通过飞书重新登录")
 
     async def check(self) -> bool:
         if not self.headers:
@@ -96,8 +101,7 @@ class AuthGuard:
         await self.ensure()
         query = urlencode(request_context(self.headers))
         response = await self.site.page.context.request.get(
-            f"{self.site.origin}/cyy_gatewayapi/user/buyer/v3/"
-            f"user_audiences?{query}",
+            f"{self.site.origin}/cyy_gatewayapi/user/buyer/v3/user_audiences?{query}",
             headers=self.headers,
         )
         if not response.ok:
@@ -122,17 +126,6 @@ class AuthGuard:
             if audience_id and name and masked_id:
                 result.append(OfficialAudience(audience_id, name, masked_id))
         return tuple(result)
-
-    @staticmethod
-    def interval(remaining_seconds: float) -> float:
-        if remaining_seconds > 3600:
-            return 900
-        if remaining_seconds > 600:
-            return 300
-        if remaining_seconds > 120:
-            return 60
-        return 15
-
 
 def request_context(headers: dict[str, str] | None = None) -> dict[str, str]:
     headers = headers or {}
