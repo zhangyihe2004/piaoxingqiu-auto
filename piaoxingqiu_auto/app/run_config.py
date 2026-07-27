@@ -35,7 +35,7 @@ def build_order_config(
             task["real_name_mode"],
             people,
         ),
-        browser=_browser_config(account, system),
+        browser=build_browser_config(account, system),
         create_order=system.create_order_enabled,
     )
 
@@ -46,12 +46,12 @@ def build_login_config(task, account, system: SystemConfig) -> AccountRunConfig:
         purchase=PurchaseConfig(
             task["session_name"], (), (), 0, task["real_name_mode"], ()
         ),
-        browser=_browser_config(account, system),
+        browser=build_browser_config(account, system),
         create_order=False,
     )
 
 
-def _browser_config(account, system: SystemConfig) -> BrowserConfig:
+def build_browser_config(account, system: SystemConfig) -> BrowserConfig:
     return BrowserConfig(
         account_home(account["profile_key"]) / "browser-profile",
         system.browser_headless,

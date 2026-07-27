@@ -10,19 +10,18 @@ from urllib.parse import urlsplit
 
 from playwright.async_api import Locator, Page, Response
 
-from piaoxingqiu_auto.platform.auth import AuthGuard, AuthenticationRequired
 from piaoxingqiu_auto.runtime.browser import blank_page, persistent_browser
 from piaoxingqiu_auto.config import (
     remove_account_home,
     validate_phone,
 )
-from piaoxingqiu_auto.app.run_config import build_login_config
+from piaoxingqiu_auto.app.run_config import build_browser_config
 from piaoxingqiu_auto.domain.models import SystemConfig
 from piaoxingqiu_auto.app.database import Database
 from piaoxingqiu_auto.adapters.feishu_gateway import FeishuGateway, IncomingCommand
-from piaoxingqiu_auto.platform.booking import PurchasePage
 
 
+LOGIN_URL = "https://m.piaoxingqiu.com/mine"
 SEND_CODE_PATH = "/pub/v5/send_verify_code"
 LOGIN_PATH = "/pub/v3/login_or_register"
 IMAGE_CODE_REQUIRED = {"15012012", "15012018"}
@@ -42,7 +41,6 @@ class APIResult:
 @dataclass
 class LoginSession:
     owner: str
-    task_id: int
     phase: str = "PHONE"
     account_id: int | None = None
     context_manager: Any = None
@@ -71,17 +69,10 @@ class FeishuLoginManager:
         self.sessions: dict[str, LoginSession] = {}
 
     def start(self, command: IncomingCommand) -> str:
-        tasks = self.db.list_tasks()
-        if not tasks:
-            return "当前没有抢票任务，请先搜索并创建任务。"
-        task_id = int(
-            next((task for task in tasks if task["status"] == "active"), tasks[0])["id"]
-        )
         if command.sender_open_id in self.sessions:
             return "你已有登录流程进行中；发送“取消”后才能重新开始。"
         self.sessions[command.sender_open_id] = LoginSession(
             command.sender_open_id,
-            task_id,
             last_message_id=command.message_id,
             touched_at=time.monotonic(),
         )
@@ -100,7 +91,7 @@ class FeishuLoginManager:
         if command.text.strip() == "取消":
             account_id = session.account_id
             release = session.release_on_failure
-            await self._drop(session, release=session.release_on_failure)
+            await self._drop(session, release=release)
             if account_id and not release:
                 self.db.set_account_status(account_id, "NEEDS_LOGIN")
                 return "登录已取消；账号资料已保留，状态为登录失效。"
@@ -172,41 +163,40 @@ class FeishuLoginManager:
             account = self.db.reserve_account(phone)
             session.account_id = int(account["id"])
             session.release_on_failure = True
-        return await self._begin_login(session, command, account, phone)
+        return await self._begin_login(session, account, phone)
 
     async def _begin_login(
         self,
         session: LoginSession,
-        command: IncomingCommand,
         account,
         phone: str,
     ) -> str:
-        task = self.db.get_task(session.task_id)
-        assert task is not None
-        config = build_login_config(task, account, self.system)
-        manager = persistent_browser(config.browser)
+        browser = build_browser_config(account, self.system)
+        manager = persistent_browser(browser)
         context = await manager.__aenter__()
         session.context_manager = manager
         page = await blank_page(context)
         session.page = page
-        site = PurchasePage(page, config)
-        await site.open_purchase()
-        popup = page.locator(".global-login-popup:visible")
-        login = await _wait_optional_unique(popup)
-        if login is None:
-            try:
-                await AuthGuard(site).ensure()
-            except AuthenticationRequired:
-                login = await _wait_unique(popup, "登录弹层")
-            else:
-                assert session.account_id is not None
-                account_id = session.account_id
-                self.db.set_account_status(account_id, "READY")
-                await self._drop(session, release=False)
-                return (
-                    f"账号 #{account_id} 当前登录状态仍然有效，无需重新验证。"
-                    f"{self._configuration_prompt(account_id)}"
-                )
+        await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        entry = await _wait_unique(
+            page.locator(".user-icon-wrap:visible"), "票星球账号入口"
+        )
+        trigger = await _wait_unique(
+            entry.locator(".login-title:visible"), "票星球登录状态"
+        )
+        if (await trigger.inner_text()).strip() != "立即登录":
+            assert session.account_id is not None
+            account_id = session.account_id
+            self.db.set_account_status(account_id, "READY")
+            await self._drop(session, release=False)
+            return (
+                f"账号 #{account_id} 当前登录状态仍然有效，无需重新验证。"
+                f"{self._configuration_prompt(account_id)}"
+            )
+        await trigger.evaluate("element => element.click()")
+        login = await _wait_unique(
+            page.locator(".global-login-popup:visible"), "登录弹层"
+        )
         session.login = login
         step = await _wait_unique(
             login.locator(".login-step:visible"), "手机号登录步骤"
@@ -230,7 +220,7 @@ class FeishuLoginManager:
         if result.code not in IMAGE_CODE_REQUIRED:
             raise RuntimeError(_api_error("发送短信验证码失败", result))
         session.phase = "IMAGE"
-        await self._send_captcha(session, command.message_id)
+        await self._send_captcha(session)
         return "请查看上一条验证码图片，直接回复 4 位图形验证码。\n退出：取消"
 
     async def cancel_account(self, account_id: int) -> None:
@@ -266,7 +256,7 @@ class FeishuLoginManager:
                 "图形验证码已通过，短信验证码已发送，请直接回复短信验证码。\n退出：取消"
             )
         if result.code in IMAGE_CODE_REQUIRED:
-            await self._send_captcha(session, command.message_id)
+            await self._send_captcha(session)
             return (
                 f"图形验证码未通过：{result.message}\n已刷新图片，请重试。\n退出：取消"
             )
@@ -300,9 +290,14 @@ class FeishuLoginManager:
         return f"账号 #{account_id} 登录成功。{self._configuration_prompt(account_id)}"
 
     def _configuration_prompt(self, account_id: int) -> str:
-        return f"\n\n下一步：绑定 <任务ID> {account_id}"
+        if self.db.list_tasks():
+            return f"\n\n下一步：绑定 <任务ID> {account_id}"
+        return (
+            "\n\n当前没有抢票任务。"
+            f"\n下一步：搜索 <关键词>；创建任务后发送：绑定 <任务ID> {account_id}"
+        )
 
-    async def _send_captcha(self, session: LoginSession, message_id: str) -> None:
+    async def _send_captcha(self, session: LoginSession) -> None:
         assert session.page is not None
         dialog = await _wait_unique(
             session.page.locator(".alertDialog:visible"), "图形验证码弹层"
@@ -312,7 +307,7 @@ class FeishuLoginManager:
             "图形验证码图片",
         )
         content = await image.screenshot()
-        if not await self.feishu.reply_image(message_id, content):
+        if not await self.feishu.reply_image(session.last_message_id, content):
             raise RuntimeError("验证码图片发送到飞书失败")
 
     async def _drop(self, session: LoginSession, *, release: bool) -> None:
@@ -339,17 +334,6 @@ async def _wait_unique(locator: Locator, label: str) -> Locator:
             break
         await asyncio.sleep(0.25)
     raise RuntimeError(f"{label}应唯一可见，实际找到 {count} 个")
-
-
-async def _wait_optional_unique(locator: Locator) -> Locator | None:
-    for _ in range(10):
-        count = await locator.count()
-        if count == 1:
-            return locator.first
-        if count > 1:
-            raise RuntimeError(f"登录弹层应唯一可见，实际找到 {count} 个")
-        await asyncio.sleep(0.25)
-    return None
 
 
 async def _wait_enabled(locator: Locator, label: str) -> None:
