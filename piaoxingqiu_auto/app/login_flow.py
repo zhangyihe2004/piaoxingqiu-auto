@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import time
 from contextlib import suppress
 from collections.abc import Awaitable, Callable
@@ -306,7 +307,7 @@ class FeishuLoginManager:
             dialog.locator("img.YZM-image:visible, .YZM-image img:visible"),
             "图形验证码图片",
         )
-        content = await image.screenshot()
+        content = await _captcha_png(image)
         if not await self.feishu.reply_image(session.last_message_id, content):
             raise RuntimeError("验证码图片发送到飞书失败")
 
@@ -323,6 +324,27 @@ class FeishuLoginManager:
                     remove_account_home, str(account["profile_key"])
                 )
                 self.db.delete_account(session.account_id)
+
+
+async def _captcha_png(image: Locator) -> bytes:
+    try:
+        encoded = await image.evaluate(
+            """
+            element => {
+                if (!element.complete || !element.naturalWidth) {
+                    throw new Error("captcha image is not loaded");
+                }
+                const canvas = document.createElement("canvas");
+                canvas.width = element.naturalWidth;
+                canvas.height = element.naturalHeight;
+                canvas.getContext("2d").drawImage(element, 0, 0);
+                return canvas.toDataURL("image/png").split(",", 2)[1];
+            }
+            """
+        )
+        return base64.b64decode(str(encoded), validate=True)
+    except Exception as exc:
+        raise RuntimeError("读取验证码原图失败") from exc
 
 
 async def _wait_unique(locator: Locator, label: str) -> Locator:
