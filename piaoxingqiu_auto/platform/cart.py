@@ -183,11 +183,19 @@ class CartClient:
             pre_response, location_id = await asyncio.gather(pre_task, location_task)
             audience_ids = await audience_task if audience_task else []
             promotions = await promotion_task if promotion_task else None
-            if promotions is None and any(
+            pre_has_activity = any(
                 item.get("priceItemType") == "ACTIVITY_DISCOUNT_FEE"
                 for item in pre_response["data"]["orders"][0]["priceItems"]
-            ):
+            )
+            if promotions is None and pre_has_activity:
                 promotions = await self._promotions()
+            activity_prices = (
+                await self._activity_prices(pre_request, promotions)
+                if promotions is not None
+                else []
+            )
+            if pre_has_activity and not activity_prices:
+                raise RuntimeError("官方购物模型未生成预下单中的活动优惠")
         except BaseException:
             for task in tasks:
                 if not task.done():
@@ -206,6 +214,7 @@ class CartClient:
             self.site.config.purchase.real_name_mode,
             price_groups,
             promotions,
+            activity_prices,
         )
         return CartOrder(
             payload,
@@ -214,10 +223,10 @@ class CartClient:
                 quantity,
                 purchase_unit(self.site.config.project.support_seat_picking),
                 plans,
-                _pay_amount(pre_response),
+                _display_money(payload["paymentParam"]["payAmount"]),
                 any(
                     float(item["priceItemVal"]) < 0
-                    for item in pre_response["data"]["orders"][0]["priceItems"]
+                    for item in payload["priceItemParams"]
                 ),
             ),
         )
@@ -259,6 +268,125 @@ class CartClient:
             method="GET",
         )
         return payload["data"]
+
+    async def _activity_prices(
+        self,
+        pre_request: dict,
+        promotions: dict,
+    ) -> list[dict]:
+        prices = await self.site.page.evaluate(
+            """
+            async ({ preRequest, promotions }) => {
+              const resources = performance.getEntriesByType("resource")
+                .map(entry => entry.name)
+                .filter(url => /\\/shopping\\.[^/]+\\.js(?:\\?|$)/.test(url));
+              let SaleAssistant;
+              let PromotionDiscount;
+              for (const url of resources) {
+                const loaded = await import(url);
+                SaleAssistant = Object.values(loaded).find(
+                  value => typeof value?.prototype?.takeTickets === "function"
+                    && typeof value?.prototype?.selectShow === "function"
+                );
+                PromotionDiscount = Object.values(loaded).find(
+                  value => value?.PromotionDiscountType === "promotionDiscount"
+                );
+                if (SaleAssistant && PromotionDiscount) {
+                  break;
+                }
+              }
+              if (!SaleAssistant || !PromotionDiscount) {
+                throw new Error("未找到官方购物模型");
+              }
+
+              const order = preRequest.orders[0];
+              const firstItem = order.items[0];
+              const showId = firstItem.spu.showId;
+              const sessionId = firstItem.spu.sessionId;
+              const [sessionResponse, planResponse] = await Promise.all([
+                fetch(
+                  `/cyy_gatewayapi/show/pub/v5/show/${showId}/sessions`
+                  + "?source=FROM_QUICK_ORDER&src=WEB"
+                ).then(response => response.json()),
+                fetch(
+                  `/cyy_gatewayapi/show/pub/v5/show/${showId}/session/`
+                  + `${sessionId}/seat_plans?source=FROM_QUICK_ORDER&src=WEB`
+                ).then(response => response.json())
+              ]);
+              const session = sessionResponse.data?.find(
+                item => item.bizShowSessionId === sessionId
+              );
+              const plans = planResponse.data?.seatPlans || [];
+              if (!session || !plans.length) {
+                throw new Error("官方购物模型缺少场次或票档数据");
+              }
+
+              const tickets = [];
+              for (const item of order.items) {
+                const plan = plans.find(
+                  value => value.seatPlanId === item.sku.skuId
+                );
+                if (!plan) {
+                  throw new Error(`官方购物模型未找到票档 ${item.sku.skuId}`);
+                }
+                for (const ticket of item.sku.ticketItems) {
+                  const base = item.sku.skuType === "COMBO"
+                    ? plan.items?.find(
+                        value => (value.bizSeatPlanId || value.seatPlanId)
+                          === ticket.comboItemId
+                      )
+                    : plan;
+                  if (!base) throw new Error("官方购物模型未找到套票子票档");
+                  tickets.push({
+                    generateId: ticket.id,
+                    stdSeatPlanId: base.stdSeatPlanId,
+                    seatPlanId: base.bizSeatPlanId || base.seatPlanId,
+                    seatPlanName: base.itemSeatPlanName || base.seatPlanName,
+                    originalPrice: base.originalPrice,
+                    ticketPrice: base.originalPrice,
+                    seatId: ticket.seatConcreteId,
+                    zoneConcreteId: ticket.zoneConcreteId,
+                    groupId: ticket.groupId,
+                    ...(item.sku.skuType === "COMBO"
+                      ? {
+                          combo: {
+                            ...plan,
+                            id: ticket.seatGroupId || ticket.id,
+                            comboId: plan.seatPlanId,
+                            comboPrice: plan.originalPrice
+                          }
+                        }
+                      : {})
+                  });
+                }
+              }
+
+              const assistant = new SaleAssistant();
+              assistant.selectShow({
+                showId,
+                stdShowId: plans[0].stdShowId
+              });
+              assistant.selectSession(session);
+              assistant.takeTickets(tickets);
+              assistant.useDiscount(new PromotionDiscount([
+                ...(promotions.sameSessionPromotions || []),
+                ...(promotions.crossSessionPromotions || [])
+              ]));
+              return assistant.priceItems
+                .filter(
+                  item => item.priceItemType === "ACTIVITY_DISCOUNT_FEE"
+                )
+                .map(item => JSON.parse(JSON.stringify(item)));
+            }
+            """,
+            {
+                "preRequest": pre_request,
+                "promotions": promotions,
+            },
+        )
+        if not isinstance(prices, list):
+            raise RuntimeError("官方购物模型未返回活动价格参数")
+        return prices
 
     async def _load_client(self) -> None:
         await self.site.page.evaluate(
@@ -492,10 +620,16 @@ def _create_payload(
     real_name_mode: str,
     groups: tuple[_ComboPriceGroup, ...],
     promotions: dict | None,
+    activity_prices: list[dict],
 ) -> dict:
     response_order = pre_response["data"]["orders"][0]
     prices = sorted(
-        response_order["priceItems"],
+        [
+            item
+            for item in response_order["priceItems"]
+            if item["priceItemType"] != "ACTIVITY_DISCOUNT_FEE"
+        ]
+        + activity_prices,
         key=lambda item: item["priceItemType"] != "TICKET_FEE",
     )
     order = pre_request["orders"][0]
@@ -508,12 +642,11 @@ def _create_payload(
     )
     params = _price_params(prices)
     for price, param in zip(prices, params):
-        value = float(price["priceItemVal"])
         if price["priceItemType"] == "COMBO_DISCOUNT_FEE":
             applications = _combo_applications(
                 groups,
                 ticket_index,
-                abs(value),
+                abs(float(price["priceItemVal"])),
             )
             param.update(
                 {
@@ -521,22 +654,6 @@ def _create_payload(
                     "tag": "COMBO",
                     "discountId": "comboDiscount",
                     "priceItemTitle": price["priceItemName"],
-                }
-            )
-        elif price["priceItemType"] == "ACTIVITY_DISCOUNT_FEE":
-            promotion = _promotion_for_price(price, promotions, ticket_index)
-            param.update(
-                {
-                    "applyTickets": _activity_applications(
-                        ticket_index,
-                        promotion,
-                        abs(value),
-                    ),
-                    "tag": price.get("tag") or "惠",
-                    "discountId": "promotionDiscount",
-                    "priceItemTitle": "满减优惠",
-                    "priceItemId": promotion["promotionId"],
-                    "priceItemIdType": promotion["promotionMethod"],
                 }
             )
     ticket_total = next(
@@ -602,40 +719,24 @@ def _create_items(
 
 def _price_params(prices: list[dict]) -> list[dict]:
     return [
-        {
-            "applyTickets": [],
-            "priceItemName": (
-                "票款总额"
-                if price["priceItemType"] == "TICKET_FEE"
-                else price["priceItemName"]
-            ),
-            "priceItemVal": _money(price["priceItemVal"]),
-            "priceItemType": price["priceItemType"],
-            "priceItemSpecies": price["priceItemSpecies"],
-            "direction": price["direction"],
-            "priceDisplay": _price_display(price["priceItemVal"]),
-        }
+        (
+            {**price, "priceItemVal": _money(price["priceItemVal"])}
+            if price["priceItemType"] == "ACTIVITY_DISCOUNT_FEE"
+            else {
+                "applyTickets": [],
+                "priceItemName": (
+                    "票款总额"
+                    if price["priceItemType"] == "TICKET_FEE"
+                    else price["priceItemName"]
+                ),
+                "priceItemVal": _money(price["priceItemVal"]),
+                "priceItemType": price["priceItemType"],
+                "priceItemSpecies": price["priceItemSpecies"],
+                "direction": price["direction"],
+                "priceDisplay": _price_display(price["priceItemVal"]),
+            }
+        )
         for price in prices
-    ]
-
-
-def _activity_applications(
-    ticket_index: dict[str, tuple[dict, dict, str, float]],
-    promotion: dict,
-    discount: float,
-) -> list[list[dict]]:
-    eligible_plan_ids = _promotion_plan_ids(promotion)
-    tickets = tuple(
-        indexed for indexed in ticket_index.values() if indexed[2] in eligible_plan_ids
-    )
-    if not tickets:
-        raise RuntimeError("预下单返回优惠，但未能定位参加活动的票档")
-    discounts = _split_discount(discount, [ticket[3] for ticket in tickets])
-    return [
-        [
-            _discount_ticket(ticket, amount, compact=True)
-            for ticket, amount in zip(tickets, discounts)
-        ]
     ]
 
 
@@ -649,10 +750,7 @@ def _combo_applications(
         raise RuntimeError("FREE_COMBO 优惠与预下单结果不一致")
     applications = []
     for group in groups:
-        ticket_discounts = _split_discount(
-            group.discount,
-            [1.0] * len(group.ticket_ids),
-        )
+        ticket_discounts = _split_discount(group.discount, len(group.ticket_ids))
         applications.append(
             [
                 _discount_ticket(ticket_index[ticket_id], discount)
@@ -662,61 +760,14 @@ def _combo_applications(
     return applications
 
 
-def _promotion_for_price(
-    price: dict,
-    promotions: dict | None,
-    ticket_index: dict[str, tuple[dict, dict, str, float]],
-) -> dict:
-    if not promotions:
-        raise RuntimeError("预下单返回活动优惠，但未取得官方促销规则")
-    selected = {indexed[2] for indexed in ticket_index.values()}
-    available = (
-        *(promotions.get("sameSessionPromotions") or []),
-        *(promotions.get("crossSessionPromotions") or []),
-    )
-    candidates = [
-        promotion
-        for promotion in available
-        if isinstance(promotion, dict)
-        and promotion.get("isValid") is not False
-        and selected & _promotion_plan_ids(promotion)
-    ]
-    name = str(price.get("priceItemName") or "")
-    named = [
-        promotion
-        for promotion in candidates
-        if name in str(promotion.get("promotionName") or "")
-        or str(promotion.get("promotionName") or "") in name
-    ]
-    matches = named if len(named) == 1 else candidates
-    if len(matches) != 1:
-        raise RuntimeError("无法唯一匹配预下单优惠与官方促销规则")
-    promotion = matches[0]
-    if not promotion.get("promotionId") or not promotion.get("promotionMethod"):
-        raise RuntimeError("官方促销规则缺少必要标识")
-    return promotion
-
-
-def _promotion_plan_ids(promotion: dict) -> set[str]:
-    return {
-        str(item.get("seatPlanId") or "")
-        for item in promotion.get("seatPlans", [])
-        if isinstance(item, dict)
-    }
-
-
 def _discount_ticket(
     indexed: tuple[dict, dict, str, float],
     discount: float,
-    *,
-    compact: bool = False,
 ) -> dict:
     ticket, spu, sku_id, _ = indexed
     result = {
         "id": ticket["id"],
-        "discountAmount": (
-            _display_money(discount) if compact else _money(discount)
-        ),
+        "discountAmount": _money(discount),
         "seatPlanId": sku_id,
         "showId": spu["showId"],
         "sessionId": spu["sessionId"],
@@ -732,20 +783,12 @@ def _discount_ticket(
     return result
 
 
-def _split_discount(total: float, weights: list[float]) -> list[float]:
-    if not weights or any(weight <= 0 for weight in weights):
-        raise RuntimeError("优惠票档价格无效")
+def _split_discount(total: float, count: int) -> list[float]:
+    if count < 1:
+        raise RuntimeError("套票中没有有效票")
     cents = round(total * 100)
-    weight_total = sum(weights)
-    result = []
-    allocated = 0
-    cumulative = 0.0
-    for weight in weights:
-        cumulative += cents * weight / weight_total
-        current = round(cumulative) - allocated
-        result.append(current / 100)
-        allocated += current
-    return result
+    value, remainder = divmod(cents, count)
+    return [(value + (index < remainder)) / 100 for index in range(count)]
 
 
 def _create_item(
@@ -811,11 +854,6 @@ def _create_base(
         "clientCurrency": pre_request["clientCurrency"],
         "orderFrom": "DEFAULT",
     }
-
-
-def _pay_amount(pre_response: dict) -> str:
-    values = pre_response["data"]["orders"][0]["priceItems"]
-    return _display_money(sum(float(item["priceItemVal"]) for item in values))
 
 
 def _number(value: float) -> int | float:
