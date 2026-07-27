@@ -27,6 +27,7 @@ from piaoxingqiu_auto.platform.inventory import GeneralAdmissionSelection, Inven
 PRE_ORDER_PATH = "/cyy_gatewayapi/trade/buyer/order/cart/v1/pre_order"
 CREATE_ORDER_PATH = "/cyy_gatewayapi/trade/buyer/order/cart/v1/create_order"
 POSITIONING_PATH = "/cyy_gatewayapi/mcommon/pub/v1/positioning"
+PROMOTIONS_PATH = "/cyy_gatewayapi/show/pub/v3/promotions/list"
 
 
 class CartRejected(RuntimeError):
@@ -117,7 +118,7 @@ class CartClient:
             len(selection.candidates),
             tuple(dict.fromkeys(item.plan for item in selection.candidates)),
             price_groups,
-            inventory.activity_plan_ids,
+            inventory.has_activity,
         )
 
     async def prepare_general(
@@ -137,11 +138,7 @@ class CartClient:
             selection.quantity,
             (selection.plan,),
             (),
-            (
-                frozenset({selection.plan_id})
-                if selection.has_activity
-                else frozenset()
-            ),
+            selection.has_activity,
         )
 
     async def create(self, payload: dict) -> None:
@@ -158,7 +155,7 @@ class CartClient:
         quantity: int,
         plans: tuple[str, ...],
         price_groups: tuple[_ComboPriceGroup, ...],
-        activity_plan_ids: frozenset[str],
+        has_activity: bool,
     ) -> CartOrder:
         required = required_audience_count(
             self.site.config.purchase.real_name_mode, quantity
@@ -174,17 +171,28 @@ class CartClient:
         audience_task = (
             asyncio.create_task(self._audience_ids(selected)) if selected else None
         )
+        promotion_task = (
+            asyncio.create_task(self._promotions()) if has_activity else None
+        )
+        tasks = tuple(
+            task
+            for task in (pre_task, location_task, audience_task, promotion_task)
+            if task
+        )
         try:
             pre_response, location_id = await asyncio.gather(pre_task, location_task)
             audience_ids = await audience_task if audience_task else []
+            promotions = await promotion_task if promotion_task else None
+            if promotions is None and any(
+                item.get("priceItemType") == "ACTIVITY_DISCOUNT_FEE"
+                for item in pre_response["data"]["orders"][0]["priceItems"]
+            ):
+                promotions = await self._promotions()
         except BaseException:
-            for task in (pre_task, location_task, audience_task):
-                if task is not None and not task.done():
+            for task in tasks:
+                if not task.done():
                     task.cancel()
-            await asyncio.gather(
-                *(task for task in (pre_task, location_task, audience_task) if task),
-                return_exceptions=True,
-            )
+            await asyncio.gather(*tasks, return_exceptions=True)
             raise
         finally:
             self.site.record_timing(
@@ -197,7 +205,7 @@ class CartClient:
             audience_ids,
             self.site.config.purchase.real_name_mode,
             price_groups,
-            activity_plan_ids,
+            promotions,
         )
         return CartOrder(
             payload,
@@ -243,6 +251,15 @@ class CartClient:
         self.cache["location_id"] = location_id
         return location_id
 
+    async def _promotions(self) -> dict:
+        show_id, _ = self.site.booking_ids
+        payload = await self._request(
+            f"{PROMOTIONS_PATH}?showId={show_id}&verControl=true",
+            {},
+            method="GET",
+        )
+        return payload["data"]
+
     async def _load_client(self) -> None:
         await self.site.page.evaluate(
             """
@@ -269,11 +286,12 @@ class CartClient:
         endpoint: str,
         payload: dict,
         *,
+        method: str = "POST",
         tolerate_error: bool = False,
     ) -> dict:
         result = await self.site.page.evaluate(
             """
-            async ({ endpoint, payload, tolerateError }) => {
+            async ({ endpoint, method, payload, tolerateError }) => {
               window.__pxqCartClient ||= (async () => {
                 const url = performance.getEntriesByType("resource")
                   .map(entry => entry.name)
@@ -290,8 +308,8 @@ class CartClient:
               try {
                 const response = await client.request({
                   url: endpoint,
-                  method: "POST",
-                  data: payload
+                  method,
+                  ...(method === "POST" ? { data: payload } : {})
                 });
                 return { body: response?.data?.statusCode ? response.data : response };
               } catch (error) {
@@ -302,6 +320,7 @@ class CartClient:
             """,
             {
                 "endpoint": endpoint,
+                "method": method,
                 "payload": payload,
                 "tolerateError": tolerate_error,
             },
@@ -472,7 +491,7 @@ def _create_payload(
     audience_ids: list[str],
     real_name_mode: str,
     groups: tuple[_ComboPriceGroup, ...],
-    activity_plan_ids: frozenset[str],
+    promotions: dict | None,
 ) -> dict:
     response_order = pre_response["data"]["orders"][0]
     prices = sorted(
@@ -485,15 +504,15 @@ def _create_payload(
         response_order["supportDeliveries"][0]["name"],
         audience_ids,
         real_name_mode,
+        promotions,
     )
     params = _price_params(prices)
     for price, param in zip(prices, params):
         value = float(price["priceItemVal"])
         if price["priceItemType"] == "COMBO_DISCOUNT_FEE":
-            applications = _discount_applications(
+            applications = _combo_applications(
                 groups,
                 ticket_index,
-                activity_plan_ids,
                 abs(value),
             )
             param.update(
@@ -502,6 +521,25 @@ def _create_payload(
                     "tag": "COMBO",
                     "discountId": "comboDiscount",
                     "priceItemTitle": price["priceItemName"],
+                }
+            )
+        elif price["priceItemType"] == "ACTIVITY_DISCOUNT_FEE":
+            promotion = _promotion_for_price(price, promotions, ticket_index)
+            param.update(
+                {
+                    "applyTickets": _activity_applications(
+                        ticket_index,
+                        promotion,
+                        abs(value),
+                    ),
+                    "tag": price.get("tag") or "惠",
+                    "discountId": "promotionDiscount",
+                    "priceItemName": (
+                        promotion.get("promotionName") or price["priceItemName"]
+                    ),
+                    "priceItemTitle": "满减满折",
+                    "priceItemId": promotion["promotionId"],
+                    "priceItemIdType": promotion["promotionMethod"],
                 }
             )
     ticket_total = next(
@@ -530,6 +568,7 @@ def _create_items(
     delivery: str,
     audience_ids: list[str],
     real_name_mode: str,
+    promotions: dict | None,
 ) -> tuple[list[dict], dict[str, tuple[dict, dict, str, float]]]:
     ticket_count = sum(len(item["sku"]["ticketItems"]) for item in order["items"])
     if real_name_mode == "PER_TICKET" and len(audience_ids) != ticket_count:
@@ -553,7 +592,14 @@ def _create_items(
                 item["sku"]["skuId"],
                 float(item["sku"]["ticketPrice"]),
             )
-        items.append(_create_item(item, tickets, delivery))
+        items.append(
+            _create_item(
+                item,
+                tickets,
+                delivery,
+                promotions,
+            )
+        )
     return items, ticket_index
 
 
@@ -578,11 +624,12 @@ def _price_params(prices: list[dict]) -> list[dict]:
 
 def _activity_applications(
     ticket_index: dict[str, tuple[dict, dict, str, float]],
-    activity_plan_ids: frozenset[str],
+    promotion: dict,
     discount: float,
 ) -> list[list[dict]]:
+    eligible_plan_ids = _promotion_plan_ids(promotion)
     tickets = tuple(
-        indexed for indexed in ticket_index.values() if indexed[2] in activity_plan_ids
+        indexed for indexed in ticket_index.values() if indexed[2] in eligible_plan_ids
     )
     if not tickets:
         raise RuntimeError("预下单返回优惠，但未能定位参加活动的票档")
@@ -595,36 +642,14 @@ def _activity_applications(
     ]
 
 
-def _discount_applications(
-    groups: tuple[_ComboPriceGroup, ...],
-    ticket_index: dict[str, tuple[dict, dict, str, float]],
-    activity_plan_ids: frozenset[str],
-    actual_discount: float,
-) -> list[list[dict]]:
-    combo_discount = sum(group.discount for group in groups)
-    activity_discount = actual_discount - combo_discount
-    if activity_discount < -0.02:
-        raise RuntimeError("FREE_COMBO 优惠大于预下单优惠，已停止创建订单")
-    applications = (
-        _combo_applications(groups, ticket_index) if groups else []
-    )
-    if activity_discount > 0.02:
-        applications.extend(
-            _activity_applications(
-                ticket_index,
-                activity_plan_ids,
-                activity_discount,
-            )
-        )
-    if not applications:
-        raise RuntimeError("预下单返回优惠，但未能构造优惠票档映射")
-    return applications
-
-
 def _combo_applications(
     groups: tuple[_ComboPriceGroup, ...],
     ticket_index: dict[str, tuple[dict, dict, str, float]],
+    actual_discount: float,
 ) -> list[list[dict]]:
+    expected = sum(group.discount for group in groups)
+    if not groups or abs(expected - actual_discount) > 0.02:
+        raise RuntimeError("FREE_COMBO 优惠与预下单结果不一致")
     applications = []
     for group in groups:
         ticket_discounts = _split_discount(
@@ -638,6 +663,49 @@ def _combo_applications(
             ]
         )
     return applications
+
+
+def _promotion_for_price(
+    price: dict,
+    promotions: dict | None,
+    ticket_index: dict[str, tuple[dict, dict, str, float]],
+) -> dict:
+    if not promotions:
+        raise RuntimeError("预下单返回活动优惠，但未取得官方促销规则")
+    selected = {indexed[2] for indexed in ticket_index.values()}
+    available = (
+        *(promotions.get("sameSessionPromotions") or []),
+        *(promotions.get("crossSessionPromotions") or []),
+    )
+    candidates = [
+        promotion
+        for promotion in available
+        if isinstance(promotion, dict)
+        and promotion.get("isValid") is not False
+        and selected & _promotion_plan_ids(promotion)
+    ]
+    name = str(price.get("priceItemName") or "")
+    named = [
+        promotion
+        for promotion in candidates
+        if name in str(promotion.get("promotionName") or "")
+        or str(promotion.get("promotionName") or "") in name
+    ]
+    matches = named if len(named) == 1 else candidates
+    if len(matches) != 1:
+        raise RuntimeError("无法唯一匹配预下单优惠与官方促销规则")
+    promotion = matches[0]
+    if not promotion.get("promotionId") or not promotion.get("promotionMethod"):
+        raise RuntimeError("官方促销规则缺少必要标识")
+    return promotion
+
+
+def _promotion_plan_ids(promotion: dict) -> set[str]:
+    return {
+        str(item.get("seatPlanId") or "")
+        for item in promotion.get("seatPlans", [])
+        if isinstance(item, dict)
+    }
 
 
 def _discount_ticket(
@@ -679,7 +747,13 @@ def _split_discount(total: float, weights: list[float]) -> list[float]:
     return result
 
 
-def _create_item(item: dict, tickets: list[dict], delivery: str) -> dict:
+def _create_item(
+    item: dict,
+    tickets: list[dict],
+    delivery: str,
+    promotions: dict | None,
+) -> dict:
+    promotions = promotions or {}
     return {
         "sku": {
             **item["sku"],
@@ -688,8 +762,12 @@ def _create_item(item: dict, tickets: list[dict], delivery: str) -> dict:
         },
         "spu": {
             **item["spu"],
-            "promotionVersionHash": "EMPTY_PROMOTION_HASH",
-            "addPromoVersionHash": "EMPTY_PROMOTION_HASH",
+            "promotionVersionHash": (
+                promotions.get("promotionVersionHash") or "EMPTY_PROMOTION_HASH"
+            ),
+            "addPromoVersionHash": (
+                promotions.get("addPromoVersionHash") or "EMPTY_PROMOTION_HASH"
+            ),
         },
         "deliverMethod": delivery,
     }

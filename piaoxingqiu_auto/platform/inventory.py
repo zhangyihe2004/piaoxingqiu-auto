@@ -97,7 +97,7 @@ class PlanInventory:
     caps: dict[str, int]
     prices: dict[str, float]
     combos: tuple[dict[str, Any], ...]
-    activity_plan_ids: frozenset[str]
+    has_activity: bool
 
 
 @dataclass
@@ -312,7 +312,7 @@ class Inventory:
     rejected_seat_ids: set[str] = field(default_factory=set)
     plan_prices: dict[str, float] = field(default_factory=dict)
     combo_plans: tuple[dict[str, Any], ...] = ()
-    activity_plan_ids: frozenset[str] = frozenset()
+    has_activity: bool = False
 
     @classmethod
     async def open(cls, site: PurchasePage, auth: AuthGuard) -> Inventory:
@@ -350,7 +350,7 @@ class Inventory:
         plan_caps = plan_inventory.caps
         self.plan_prices = plan_inventory.prices
         self.combo_plans = plan_inventory.combos
-        self.activity_plan_ids = plan_inventory.activity_plan_ids
+        self.has_activity = plan_inventory.has_activity
         inventories = {
             (rank, plan_name, plan_id): {
                 str(record["zoneConcreteId"]): bits
@@ -616,9 +616,7 @@ async def _fetch_plan_inventory(
         combos=tuple(
             item for item in plans if item.get("seatPlanCategory") == "FREE_COMBO"
         ),
-        activity_plan_ids=frozenset(
-            str(item["seatPlanId"]) for item in base if item.get("hasActivity")
-        ),
+        has_activity=any(item.get("hasActivity") for item in base),
     )
 
 
