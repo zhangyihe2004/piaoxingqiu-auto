@@ -534,10 +534,7 @@ def _create_payload(
                     ),
                     "tag": price.get("tag") or "惠",
                     "discountId": "promotionDiscount",
-                    "priceItemName": (
-                        promotion.get("promotionName") or price["priceItemName"]
-                    ),
-                    "priceItemTitle": "满减满折",
+                    "priceItemTitle": "满减优惠",
                     "priceItemId": promotion["promotionId"],
                     "priceItemIdType": promotion["promotionMethod"],
                 }
@@ -636,7 +633,7 @@ def _activity_applications(
     discounts = _split_discount(discount, [ticket[3] for ticket in tickets])
     return [
         [
-            _discount_ticket(ticket, amount)
+            _discount_ticket(ticket, amount, compact=True)
             for ticket, amount in zip(tickets, discounts)
         ]
     ]
@@ -711,11 +708,15 @@ def _promotion_plan_ids(promotion: dict) -> set[str]:
 def _discount_ticket(
     indexed: tuple[dict, dict, str, float],
     discount: float,
+    *,
+    compact: bool = False,
 ) -> dict:
     ticket, spu, sku_id, _ = indexed
     result = {
         "id": ticket["id"],
-        "discountAmount": _money(discount),
+        "discountAmount": (
+            _display_money(discount) if compact else _money(discount)
+        ),
         "seatPlanId": sku_id,
         "showId": spu["showId"],
         "sessionId": spu["sessionId"],
