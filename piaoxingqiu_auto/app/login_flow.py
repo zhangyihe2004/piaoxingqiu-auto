@@ -24,7 +24,7 @@ from piaoxingqiu_auto.adapters.feishu_gateway import FeishuGateway, IncomingComm
 LOGIN_URL = "https://m.piaoxingqiu.com/mine"
 SEND_CODE_PATH = "/pub/v5/send_verify_code"
 LOGIN_PATH = "/pub/v3/login_or_register"
-IMAGE_CODE_REQUIRED = {"15012012", "15012018"}
+IMAGE_CODE_RETRYABLE = {"15012012", "15012016", "15012018"}
 SESSION_TTL = 300
 
 
@@ -217,7 +217,7 @@ class FeishuLoginManager:
             session.phase = "SMS"
             await _wait_unique(login.locator(".code-step:visible"), "短信验证码步骤")
             return "短信验证码已发送，请直接回复验证码。\n退出：取消"
-        if result.code not in IMAGE_CODE_REQUIRED:
+        if result.code not in IMAGE_CODE_RETRYABLE:
             raise RuntimeError(_api_error("发送短信验证码失败", result))
         session.phase = "IMAGE"
         await self._send_captcha(session)
@@ -255,7 +255,7 @@ class FeishuLoginManager:
             return (
                 "图形验证码已通过，短信验证码已发送，请直接回复短信验证码。\n退出：取消"
             )
-        if result.code in IMAGE_CODE_REQUIRED:
+        if result.code in IMAGE_CODE_RETRYABLE:
             await self._send_captcha(session)
             return (
                 f"图形验证码未通过：{result.message}\n已刷新图片，请重试。\n退出：取消"
