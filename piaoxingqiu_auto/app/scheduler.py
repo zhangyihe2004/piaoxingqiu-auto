@@ -19,7 +19,11 @@ from piaoxingqiu_auto.runtime.browser import (
     AccountBrowserPool,
 )
 from piaoxingqiu_auto.app.run_config import build_login_config, build_order_config
-from piaoxingqiu_auto.domain.models import AccountRunConfig, SystemConfig
+from piaoxingqiu_auto.domain.models import (
+    AccountRunConfig,
+    SystemConfig,
+    purchase_unit,
+)
 from piaoxingqiu_auto.app.database import Database
 from piaoxingqiu_auto.adapters.feishu_gateway import FeishuGateway
 from piaoxingqiu_auto.platform.order_guard import PersistentOrderGuard
@@ -78,7 +82,7 @@ class TaskScheduler:
         self.semaphore = asyncio.Semaphore(system.max_concurrent_accounts)
         self.login_semaphore = asyncio.Semaphore(min(system.max_concurrent_accounts, 4))
         self.jobs: dict[int, asyncio.Task] = {}
-        self.job_bindings: dict[int, tuple[int, int]] = {}
+        self.job_tasks: dict[int, int] = {}
         self.warmups: dict[tuple[int, int], asyncio.Task] = {}
         self.checks: dict[int, asyncio.Task] = {}
         self.sale_watchers: dict[int, asyncio.Task[None]] = {}
@@ -299,6 +303,7 @@ class TaskScheduler:
             self.available_plans[task_id] = current
             return
         available = [plan for plan in plans if str(plan["seat_plan_id"]) in added]
+        unit = purchase_unit(bool(task["support_seat_picking"]))
         self._send_notice(
             task_id,
             PendingNotice(
@@ -310,7 +315,8 @@ class TaskScheduler:
                         f"场次：{task['session_name']}",
                         *(
                             f"· {plan['plan_name']}：最多可买 "
-                            f"{plan['can_buy_count'] * plan['unit_qty']} 张"
+                            f"{plan['can_buy_count'] * plan['unit_qty'] if task['support_seat_picking'] else plan['can_buy_count']} "
+                            f"{unit}"
                             for plan in available
                         ),
                     )
@@ -497,6 +503,7 @@ class TaskScheduler:
         self.next_poll[task_id] = time.monotonic() + delay
 
     def _prune_runtime_state(self, active_ids: set[int]) -> None:
+        stale_ids = set(self.sale_watchers)
         for mapping in (
             self.next_poll,
             self.failures,
@@ -504,10 +511,9 @@ class TaskScheduler:
             self.available_plans,
             self.phases,
         ):
-            for task_id in set(mapping) - active_ids:
-                mapping.pop(task_id, None)
-        for task_id in set(self.sale_watchers) - active_ids:
-            self.sale_watchers.pop(task_id).cancel()
+            stale_ids.update(mapping)
+        for task_id in stale_ids - active_ids:
+            self._clear_runtime_state(task_id)
 
     def _clear_runtime_state(self, task_id: int) -> None:
         for mapping in (
@@ -550,12 +556,12 @@ class TaskScheduler:
             ),
         )
         self.jobs[account_id] = job
-        self.job_bindings[account_id] = (task_id, account_id)
+        self.job_tasks[account_id] = task_id
 
         def forget_job(_job: asyncio.Task) -> None:
             if self.jobs.get(account_id) is _job:
                 self.jobs.pop(account_id, None)
-                self.job_bindings.pop(account_id, None)
+                self.job_tasks.pop(account_id, None)
             try:
                 outcome = _job.result()
             except asyncio.CancelledError:
@@ -782,6 +788,8 @@ class TaskScheduler:
                 result.fulfilled_quantity,
                 result.removed_audiences,
             )
+            if result.status == "STOP_BINDING":
+                self.db.deactivate_binding(task_id, account_id)
             current = self.db.get_binding(task_id, account_id)
             if current is None:
                 return "执行完成后账号已不存在"
@@ -806,6 +814,8 @@ class TaskScheduler:
                 )
             if result.status != "RESTOCK":
                 self._notify_result(task_id, account_id, task, result)
+            if result.status == "STOP_BINDING":
+                await self.release_account_if_idle(account_id)
             return result.status
 
     def _schedule_login_checks(self, task, remaining: float | None) -> None:
@@ -824,7 +834,7 @@ class TaskScheduler:
                 or account_id in self.jobs
                 or any(key[1] == account_id for key in self.warmups)
                 or account_id in self.checks
-                or now < next_check <= now + LOGIN_CHECK_INTERVAL
+                or now < next_check
             ):
                 continue
             self.next_auth[account_id] = now + LOGIN_CHECK_INTERVAL
@@ -878,6 +888,7 @@ class TaskScheduler:
             "UNKNOWN": "订单结果未知",
             "NEEDS_LOGIN": "账号需要重新登录",
             "COMPLETE": "目标数量已完成",
+            "STOP_BINDING": "账号任务已停止",
         }.get(result.status, "抢票执行异常")
         color = "green" if result.status in {"CREATED", "COMPLETE"} else "orange"
         action = {
@@ -891,6 +902,9 @@ class TaskScheduler:
             ),
             "NEEDS_LOGIN": "下一步：登录",
             "COMPLETE": f"下一步：绑定 {task_id} {account_id}",
+            "STOP_BINDING": (
+                f"下一步：处理风控后发送：启动 {task_id} {account_id}"
+            ),
         }.get(result.status, "状态：该绑定保持启动，将自动继续等待。")
         body = (
             f"任务 #{task['id']}｜账号 #{account_id}\n"
@@ -920,10 +934,7 @@ class TaskScheduler:
                     pending.pop(key, None)
         activities = []
         job = self.jobs.get(account_id)
-        if job is not None and self.job_bindings.get(account_id) == (
-            task_id,
-            account_id,
-        ):
+        if job is not None and self.job_tasks.get(account_id) == task_id:
             activities.append(job)
         if warmup := self.warmups.pop((task_id, account_id), None):
             activities.append(warmup)

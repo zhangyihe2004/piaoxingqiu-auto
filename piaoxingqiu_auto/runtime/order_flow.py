@@ -113,10 +113,8 @@ async def warm_account(
     await auth.ensure()
     await CartClient(site, auth, runtime_cache).warm(config.purchase.audiences)
     if config.project.support_seat_picking:
-        try:
+        with suppress(StaticInventoryUnavailable):
             await InventoryBootstrap.open(site, auth).activate(preload=True)
-        except StaticInventoryUnavailable:
-            pass
 
 
 async def _run_account(
@@ -179,7 +177,6 @@ async def _run_account(
         else:
             if prewarm:
                 await cart.warm(people)
-                await site.prepare_booking()
                 await _wait_sale(sale_signal)
             await acquire_execution()
             general_source = GeneralAdmissionInventory.open(site, auth)
@@ -189,10 +186,13 @@ async def _run_account(
                 if prewarm
                 else general_source.refresh(ticket_quantity)
             )
-            selection, _ = await asyncio.gather(
-                _measure(timings, "general_inventory", load),
-                site.prepare_booking(),
-            )
+            if prewarm:
+                selection = await _measure(timings, "general_inventory", load)
+            else:
+                selection, _ = await asyncio.gather(
+                    _measure(timings, "general_inventory", load),
+                    site.prepare_booking(),
+                )
             selection, prepared = await _prepare_general(
                 cart,
                 general_source,
@@ -229,7 +229,7 @@ async def _run_account(
         action = create_failure_action(result)
         timings.finish(f"PRE_ORDER_{result.code or 'FAILED'}")
         return RunResult(
-            "NEEDS_LOGIN" if action == "NEEDS_LOGIN" else "FAILED",
+            "STOP_BINDING" if action == "STOP_BINDING" else "FAILED",
             f"预下单被明确拒绝：{_create_diagnostic(result)}",
         )
     except Exception:
@@ -242,7 +242,6 @@ async def _run_account(
         raise RuntimeError("准备阶段出现意外创建请求，已拦截并停止")
 
     attempt = 0
-    risk_rebuilds = 0
     while True:
         attempt += 1
 
@@ -300,18 +299,14 @@ async def _run_account(
             )
 
         guard.ready()
-        if action == "NEEDS_LOGIN":
-            if risk_rebuilds:
-                return RunResult(
-                    "NEEDS_LOGIN",
-                    f"重建风控环境后仍被拒绝：{diagnostic}",
-                    removed_audiences=tuple(removed),
-                    fulfilled_quantity=fulfilled_quantity,
-                )
-            risk_rebuilds += 1
-            recovery = "REBUILD"
-        else:
-            recovery = action
+        if action == "STOP_BINDING":
+            return RunResult(
+                "STOP_BINDING",
+                f"票星球拒绝继续自动提交，订单未创建：{diagnostic}",
+                removed_audiences=tuple(removed),
+                fulfilled_quantity=fulfilled_quantity,
+            )
+        recovery = action
         if action == "FAILED":
             await _save_failure(site, config, "create-failed")
             return RunResult(
@@ -404,7 +399,7 @@ async def _run_account(
             action = create_failure_action(rejected)
             timings.finish(f"RECOVER_PRE_ORDER_{rejected.code or 'FAILED'}")
             return RunResult(
-                "NEEDS_LOGIN" if action == "NEEDS_LOGIN" else "FAILED",
+                "STOP_BINDING" if action == "STOP_BINDING" else "FAILED",
                 f"冲突恢复时预下单被拒绝：{_create_diagnostic(rejected)}",
                 removed_audiences=tuple(removed),
                 fulfilled_quantity=fulfilled_quantity,
@@ -452,7 +447,6 @@ async def _prepare_seat_selection(
     if prewarm:
         await cart.warm(site.config.purchase.audiences)
         bootstrap = InventoryBootstrap.open(site, auth)
-        await site.prepare_booking()
         static_task = asyncio.create_task(
             bootstrap.wait_static(
                 remaining_seconds=prewarm_remaining,
@@ -486,7 +480,13 @@ async def _prepare_seat_selection(
         )
         return current, selection
 
-    (source, selection), _ = await asyncio.gather(load(), site.prepare_booking())
+    if prewarm:
+        source, selection = await load()
+    else:
+        (source, selection), _ = await asyncio.gather(
+            load(),
+            site.prepare_booking(),
+        )
     return source, selection
 
 
@@ -536,7 +536,6 @@ async def _prepare_cart(
     site: PurchasePage,
     auth: AuthGuard,
 ) -> tuple[T, CartOrder]:
-    risk_rebuilt = False
     for attempt in range(MAX_PREORDER_ATTEMPTS):
         await auth.require_recent()
         try:
@@ -549,9 +548,6 @@ async def _prepare_cart(
                 if reject is not None:
                     reject(selection)
             elif action == "REBUILD":
-                await site.open_purchase()
-            elif action == "NEEDS_LOGIN" and not risk_rebuilt:
-                risk_rebuilt = True
                 await site.open_purchase()
             else:
                 raise
@@ -631,7 +627,10 @@ def _created_result(
             "请在票星球逐一核对"
         )
     if remaining := target - fulfilled:
-        details.append(f"处理本单后再次启动绑定，可继续等待剩余 {remaining} 张")
+        details.append(
+            f"处理本单后再次启动绑定，可继续等待剩余 "
+            f"{remaining} {prepared.summary.unit}"
+        )
     return RunResult(
         "CREATED",
         "\n".join(details),

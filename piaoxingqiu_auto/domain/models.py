@@ -81,5 +81,9 @@ def required_audience_count(mode: str, quantity: int) -> int:
     return quantity
 
 
+def purchase_unit(support_seat_picking: bool) -> str:
+    return "张" if support_seat_picking else "份"
+
+
 def account_key(phone: str) -> str:
     return hashlib.sha256(phone.encode()).hexdigest()[:20]

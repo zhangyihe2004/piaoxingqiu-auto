@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from piaoxingqiu_auto.platform.auth import OfficialAudience
-from piaoxingqiu_auto.domain.models import required_audience_count
+from piaoxingqiu_auto.domain.models import purchase_unit, required_audience_count
 from piaoxingqiu_auto.app.database import Database
 from piaoxingqiu_auto.adapters.feishu_gateway import IncomingCommand
 from piaoxingqiu_auto.app.tasks import parse_numbers, real_name_label
@@ -267,6 +267,7 @@ class BindingSetupFlow:
     ) -> str:
         task = self._task(session)
         maximum = max(1, int(task["session_limitation"]))
+        unit = purchase_unit(bool(task["support_seat_picking"]))
         lines = [
             f"绑定任务 #{session.task_id}｜账号 #{session.account_id}（2/3）",
             "设置数量",
@@ -276,7 +277,7 @@ class BindingSetupFlow:
         lines.extend(
             (
                 "",
-                f"场次限购：最多 {maximum} 张",
+                f"场次限购：最多 {maximum} {unit}",
                 f"实名规则：{real_name_label(task['real_name_mode'])}",
                 f"发送：1~{maximum}",
                 "退出：取消",
@@ -317,9 +318,10 @@ class BindingSetupFlow:
             row["seat_plan_id"]: row["plan_name"] for row in self._task_plans(session)
         }
         task = self._task(session)
+        unit = purchase_unit(bool(task["support_seat_picking"]))
         lines = [
             f"票档：{' → '.join(plans[item] for item in session.plan_ids)}",
-            f"数量：{session.quantity} 张",
+            f"数量：{session.quantity} {unit}",
             f"实名：{real_name_label(task['real_name_mode'])}",
         ]
         if session.people:

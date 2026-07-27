@@ -89,6 +89,7 @@ class GeneralAdmissionSelection:
     quantity: int
     units: int
     price: float
+    has_activity: bool
 
 
 @dataclass(frozen=True)
@@ -96,6 +97,7 @@ class PlanInventory:
     caps: dict[str, int]
     prices: dict[str, float]
     combos: tuple[dict[str, Any], ...]
+    activity_plan_ids: frozenset[str]
 
 
 @dataclass
@@ -160,6 +162,7 @@ class GeneralAdmissionInventory:
                         quantity=units * unit_qty,
                         units=units,
                         price=float(item.get("originalPrice") or 0),
+                        has_activity=bool(item.get("hasActivity")),
                     )
                 )
         if not options:
@@ -309,6 +312,7 @@ class Inventory:
     rejected_seat_ids: set[str] = field(default_factory=set)
     plan_prices: dict[str, float] = field(default_factory=dict)
     combo_plans: tuple[dict[str, Any], ...] = ()
+    activity_plan_ids: frozenset[str] = frozenset()
 
     @classmethod
     async def open(cls, site: PurchasePage, auth: AuthGuard) -> Inventory:
@@ -346,6 +350,7 @@ class Inventory:
         plan_caps = plan_inventory.caps
         self.plan_prices = plan_inventory.prices
         self.combo_plans = plan_inventory.combos
+        self.activity_plan_ids = plan_inventory.activity_plan_ids
         inventories = {
             (rank, plan_name, plan_id): {
                 str(record["zoneConcreteId"]): bits
@@ -610,6 +615,9 @@ async def _fetch_plan_inventory(
         },
         combos=tuple(
             item for item in plans if item.get("seatPlanCategory") == "FREE_COMBO"
+        ),
+        activity_plan_ids=frozenset(
+            str(item["seatPlanId"]) for item in base if item.get("hasActivity")
         ),
     )
 

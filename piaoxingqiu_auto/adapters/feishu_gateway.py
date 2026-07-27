@@ -7,6 +7,7 @@ import json
 import logging
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -90,7 +91,7 @@ class FeishuGateway:
                         asyncio.wrap_future(disconnect_future),
                         timeout=WS_SHUTDOWN_TIMEOUT,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     if disconnect_future is not None:
                         disconnect_future.cancel()
                     log.warning("飞书长连接断开超时，将强制停止 SDK 事件循环")
@@ -99,10 +100,8 @@ class FeishuGateway:
                     pass
                 except Exception:
                     log.exception("主动断开飞书长连接失败")
-            try:
+            with suppress(RuntimeError):
                 sdk_loop.call_soon_threadsafe(sdk_loop.stop)
-            except RuntimeError:
-                pass
 
         thread = self._ws_thread
         if thread is not None and thread.is_alive():

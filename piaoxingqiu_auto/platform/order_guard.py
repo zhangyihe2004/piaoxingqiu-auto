@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -108,7 +107,7 @@ class PersistentOrderGuard:
             json.dumps(asdict(state), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        os.replace(temporary, self.path)
+        temporary.replace(self.path)
 
 
 class OrderFirewall:
