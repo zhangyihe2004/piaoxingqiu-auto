@@ -41,6 +41,7 @@ from piaoxingqiu_auto.runtime.timing import RunTimings
 log = logging.getLogger("piaoxingqiu.auto")
 MAX_CREATE_ATTEMPTS = 10
 MAX_PREORDER_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 0.25
 CREATE_ROUTE = "**/trade/buyer/order/cart/v1/create_order*"
 T = TypeVar("T")
 
@@ -360,6 +361,9 @@ async def _run_account(
             )
 
         timings.begin(attempt + 1)
+        if action == "RETRY":
+            await asyncio.sleep(RETRY_DELAY_SECONDS)
+            continue
         try:
             if config.project.support_seat_picking:
                 if seat_source is None:
@@ -549,6 +553,8 @@ async def _prepare_cart(
                     reject(selection)
             elif action == "REBUILD":
                 await site.open_purchase()
+            elif action == "RETRY":
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
             else:
                 raise
             selection = await refresh()
