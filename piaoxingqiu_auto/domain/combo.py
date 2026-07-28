@@ -16,6 +16,8 @@ class ComboVariant:
     quantity: int
     price: float
     capacity: int
+    display_tag: str
+    order: int
 
 
 @dataclass(frozen=True)
@@ -85,7 +87,7 @@ def _variants(
     wanted: set[str],
 ) -> tuple[ComboVariant, ...]:
     result = []
-    for plan in plans:
+    for order, plan in enumerate(plans):
         if (
             plan.get("seatPlanCategory") != "FREE_COMBO"
             or plan.get("saleStarted") is False
@@ -107,7 +109,13 @@ def _variants(
             continue
         price = float(plan.get("originalPrice") or 0)
         capacity = int(plan.get("canBuyCount") or 0)
-        if not plan.get("seatPlanId") or price <= 0 or capacity <= 0:
+        display_tag = str(plan.get("comboDisplayTag") or "")
+        if (
+            not plan.get("seatPlanId")
+            or price <= 0
+            or capacity <= 0
+            or display_tag not in {"COMBO", "DISCOUNT"}
+        ):
             continue
         result.append(
             ComboVariant(
@@ -116,6 +124,8 @@ def _variants(
                 quantity=item_quantity,
                 price=price,
                 capacity=capacity,
+                display_tag=display_tag,
+                order=order,
             )
         )
     return tuple(result)
@@ -137,21 +147,11 @@ def _best_units(
     ) -> None:
         nonlocal best_score, best
         if index == len(variants):
-            sizes = sorted(
-                (
-                    item.quantity
-                    for item, units in chosen
-                    for _ in range(units)
-                ),
-                reverse=True,
-            )
-            exact = len(chosen) == 1 and chosen[0][1] == 1 and remaining == 0
             score = (
-                not exact,
                 round(price + remaining * base_price, 2),
-                tuple(-size for size in sizes)
-                + (0,) * (quantity - len(sizes)),
-                tuple((item.sku_id, units) for item, units in chosen),
+                len(chosen) + bool(remaining),
+                -sum(units for _, units in chosen) - remaining,
+                tuple(sorted((item.order, units) for item, units in chosen)),
             )
             if best_score is None or score < best_score:
                 best_score = score

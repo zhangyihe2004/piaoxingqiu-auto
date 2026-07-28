@@ -73,7 +73,7 @@ def logical_plans(payload: dict[str, Any]) -> list[dict]:
         str(component.get("bizSeatPlanId") or "")
         for item in raw
         if isinstance(item, dict)
-        and (item.get("isCombo") or item.get("seatPlanCategory") == "FREE_COMBO")
+        and item.get("seatPlanCategory") == "FREE_COMBO"
         for component in item.get("items", [])
         if isinstance(component, dict) and component.get("bizSeatPlanId")
     }
@@ -91,7 +91,6 @@ def logical_plans(payload: dict[str, Any]) -> list[dict]:
         for item in raw
         if isinstance(item, dict)
         and item.get("seatPlanId")
-        and not item.get("isCombo")
         and item.get("seatPlanCategory") != "FREE_COMBO"
     ]
 

@@ -14,7 +14,6 @@ from piaoxingqiu_auto.app.scheduler import TaskScheduler
 from piaoxingqiu_auto.adapters.feishu_gateway import FeishuGateway, IncomingCommand
 from piaoxingqiu_auto.app.login_flow import FeishuLoginManager
 from piaoxingqiu_auto.platform.order_guard import PersistentOrderGuard
-from piaoxingqiu_auto.domain.models import purchase_unit
 from piaoxingqiu_auto.domain.sale import MIN_INTERVAL, sale_phase
 from piaoxingqiu_auto.app.tasks import TaskService, real_name_label
 
@@ -270,14 +269,13 @@ class CommandWorker:
             if requested_interval < MIN_INTERVAL
             else ""
         )
-        unit = purchase_unit(bool(session.get("supportSeatPicking")))
         return (
             f"已创建任务 #{task_id}\n\n"
             f"演出：{show_name}\n"
             f"场次：{session.get('sessionName', '')}\n"
             f"方式：{'选座' if session.get('supportSeatPicking') else '不选座'}\n"
             f"实名：{real_name_label(show.get('_real_name_mode', 'UNKNOWN'))}\n"
-            f"数量：每个账号 1~{int(session['limitation'])} {unit}\n"
+            f"数量：每个账号 1~{int(session['limitation'])} 张\n"
             f"间隔：{interval} 秒{adjusted}\n"
             "账号：0\n状态：等待添加账号\n\n"
             f"{self._account_next_step(task_id)}"
@@ -318,14 +316,13 @@ class CommandWorker:
         plans = self.db.get_task_plans(task_id)
         bindings = self.db.list_bindings(task_id=task_id)
         phase = sale_phase(task, plans)
-        unit = purchase_unit(bool(task["support_seat_picking"]))
         lines = [
             f"任务 #{task_id}",
             f"演出：{task['show_name']}",
             f"场次：{task['session_name']}",
             f"方式：{'选座' if task['support_seat_picking'] else '不选座'}",
             f"实名：{real_name_label(task['real_name_mode'])}",
-            f"场次限购：{task['session_limitation']} {unit}",
+            f"场次限购：{task['session_limitation']} 张",
             f"项目累计限购：{task['show_limit'] or '未提供'}",
             f"状态：{_mode(task, phase)}",
             f"间隔：{task['interval_sec']} 秒",
@@ -339,7 +336,7 @@ class CommandWorker:
                 else (
                     f"最多可买 "
                     f"{plan['can_buy_count'] * plan['unit_qty'] if task['support_seat_picking'] else plan['can_buy_count']} "
-                    f"{unit}"
+                    "张"
                 )
                 if plan["sale_started"] and plan["can_buy_count"] > 0
                 else "可售但无票"
@@ -367,7 +364,7 @@ class CommandWorker:
                         if account_plans
                         else "未配置"
                     ),
-                    f"数量：{binding['quantity']} {unit}",
+                    f"数量：{binding['quantity']} 张",
                     (
                         "观演人：无需配置"
                         if task["real_name_mode"] == "NONE"

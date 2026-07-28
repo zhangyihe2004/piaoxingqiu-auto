@@ -174,6 +174,7 @@ async def _run_account(
                 auth,
             )
             selected_ticket_count = len(selection.candidates)
+            selected_order_quantity = selected_ticket_count
         else:
             if prewarm:
                 await cart.warm(people)
@@ -202,7 +203,8 @@ async def _run_account(
                 site,
                 auth,
             )
-            selected_ticket_count = selection.quantity
+            selected_ticket_count = selection.ticket_count
+            selected_order_quantity = selection.units
         selected_people = prepared.audiences
     except AuthenticationRequired:
         timings.finish("NEEDS_LOGIN")
@@ -276,7 +278,7 @@ async def _run_account(
             guard.created(result.order_id)
             used_ids = tuple(person.masked_id for person in selected_people)
             removed.extend(item for item in used_ids if item not in removed)
-            fulfilled_quantity += selected_ticket_count
+            fulfilled_quantity += selected_order_quantity
             return _created_result(
                 result,
                 prepared,
@@ -326,6 +328,13 @@ async def _run_account(
             seat_source.reject(selection)
 
         if action == "REMOVE_AUDIENCE":
+            if selected_ticket_count != selected_order_quantity:
+                return RunResult(
+                    "STOP_BINDING",
+                    "固定套票包含已经购买的证件，请重新配置该绑定",
+                    removed_audiences=tuple(removed),
+                    fulfilled_quantity=fulfilled_quantity,
+                )
             purchased = match_configured_ids(
                 find_already_purchased_ids(result.message or ""),
                 tuple(person.masked_id for person in selected_people),
@@ -383,6 +392,7 @@ async def _run_account(
                     auth,
                 )
                 selected_ticket_count = len(selection.candidates)
+                selected_order_quantity = selected_ticket_count
             else:
                 if general_source is None:
                     raise RuntimeError("票档库存状态无效")
@@ -398,7 +408,8 @@ async def _run_account(
                     site,
                     auth,
                 )
-                selected_ticket_count = selection.quantity
+                selected_ticket_count = selection.ticket_count
+                selected_order_quantity = selection.units
             selected_people = prepared.audiences
         except CartRejected as exc:
             rejected = _rejected_result(exc)
@@ -635,7 +646,7 @@ def _created_result(
     if remaining := target - fulfilled:
         details.append(
             f"处理本单后再次启动绑定，可继续等待剩余 "
-            f"{remaining} {prepared.summary.unit}"
+            f"{remaining} 张"
         )
     return RunResult(
         "CREATED",

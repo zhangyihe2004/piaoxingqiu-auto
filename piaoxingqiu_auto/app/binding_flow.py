@@ -7,7 +7,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from piaoxingqiu_auto.platform.auth import OfficialAudience
-from piaoxingqiu_auto.domain.models import purchase_unit, required_audience_count
+from piaoxingqiu_auto.domain.models import (
+    purchase_unit_qty,
+    required_audience_count,
+)
 from piaoxingqiu_auto.app.database import Database
 from piaoxingqiu_auto.adapters.feishu_gateway import IncomingCommand
 from piaoxingqiu_auto.app.tasks import parse_numbers, real_name_label
@@ -155,14 +158,17 @@ class BindingSetupFlow:
             except ValueError as exc:
                 return self._plans_prompt(session, str(exc))
             session.plan_ids = [plans[number - 1]["seat_plan_id"] for number in numbers]
+        try:
+            self._maximum_quantity(session)
+        except ValueError as exc:
+            return self._plans_prompt(session, str(exc))
         session.phase = "QUANTITY"
         return self._quantity_prompt(session)
 
     async def _consume_quantity(
         self, session: BindingSetupSession, text: str
     ) -> str:
-        task = self._task(session)
-        maximum = max(1, int(task["session_limitation"]))
+        maximum = self._maximum_quantity(session)
         if not text.isdigit() or not 1 <= int(text) <= maximum:
             return self._quantity_prompt(
                 session, f"购票数量必须是 1~{maximum} 的整数。"
@@ -266,8 +272,7 @@ class BindingSetupFlow:
         self, session: BindingSetupSession, notice: str = ""
     ) -> str:
         task = self._task(session)
-        maximum = max(1, int(task["session_limitation"]))
-        unit = purchase_unit(bool(task["support_seat_picking"]))
+        maximum = self._maximum_quantity(session)
         lines = [
             f"绑定任务 #{session.task_id}｜账号 #{session.account_id}（2/3）",
             "设置数量",
@@ -277,7 +282,7 @@ class BindingSetupFlow:
         lines.extend(
             (
                 "",
-                f"场次限购：最多 {maximum} {unit}",
+                f"场次限购：最多 {maximum} 张",
                 f"实名规则：{real_name_label(task['real_name_mode'])}",
                 f"发送：1~{maximum}",
                 "退出：取消",
@@ -318,10 +323,9 @@ class BindingSetupFlow:
             row["seat_plan_id"]: row["plan_name"] for row in self._task_plans(session)
         }
         task = self._task(session)
-        unit = purchase_unit(bool(task["support_seat_picking"]))
         lines = [
             f"票档：{' → '.join(plans[item] for item in session.plan_ids)}",
-            f"数量：{session.quantity} {unit}",
+            f"数量：{session.quantity} 张",
             f"实名：{real_name_label(task['real_name_mode'])}",
         ]
         if session.people:
@@ -345,9 +349,29 @@ class BindingSetupFlow:
         return task
 
     def _required_people(self, session: BindingSetupSession) -> int:
-        return required_audience_count(
-            self._task(session)["real_name_mode"], session.quantity
+        ticket_count = session.quantity * purchase_unit_qty(
+            self._selected_plans(session)
         )
+        return required_audience_count(
+            self._task(session)["real_name_mode"], ticket_count
+        )
+
+    def _selected_plans(self, session: BindingSetupSession):
+        plans = {
+            row["seat_plan_id"]: row for row in self._task_plans(session)
+        }
+        selected = [plans[plan_id] for plan_id in session.plan_ids if plan_id in plans]
+        if len(selected) != len(session.plan_ids):
+            raise ValueError("已选票档已失效，请重新选择")
+        return selected
+
+    def _maximum_quantity(self, session: BindingSetupSession) -> int:
+        maximum = int(self._task(session)["session_limitation"]) // purchase_unit_qty(
+            self._selected_plans(session)
+        )
+        if maximum < 1:
+            raise ValueError("固定套票张数超过当前场次限购")
+        return maximum
 
     def _drop(self, session: BindingSetupSession) -> None:
         self.sessions.pop(session.owner, None)

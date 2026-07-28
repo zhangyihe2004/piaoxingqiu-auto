@@ -8,6 +8,7 @@ from piaoxingqiu_auto.domain.models import (
     ProjectConfig,
     PurchaseConfig,
     SystemConfig,
+    purchase_unit_qty,
     required_audience_count,
 )
 
@@ -21,8 +22,9 @@ def build_order_config(
         AudienceConfig(person["name"], person["masked_id"]) for person in audiences
     )
     quantity = int(binding["quantity"])
+    unit_qty = purchase_unit_qty(plans)
     if quantity < 1 or len(people) != required_audience_count(
-        task["real_name_mode"], quantity
+        task["real_name_mode"], quantity * unit_qty
     ):
         raise RuntimeError("绑定数量或观演人配置不完整")
     return AccountRunConfig(

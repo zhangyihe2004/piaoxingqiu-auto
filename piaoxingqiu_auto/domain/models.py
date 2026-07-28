@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -81,8 +82,15 @@ def required_audience_count(mode: str, quantity: int) -> int:
     return quantity
 
 
-def purchase_unit(support_seat_picking: bool) -> str:
-    return "张" if support_seat_picking else "份"
+def purchase_unit_qty(plans: Iterable[Mapping]) -> int:
+    selected = tuple(plans)
+    unit_qty = max(
+        (max(1, int(plan["unit_qty"])) for plan in selected),
+        default=1,
+    )
+    if unit_qty > 1 and len(selected) > 1:
+        raise ValueError("固定套票必须单独选择，不能与其他票档混合")
+    return unit_qty
 
 
 def account_key(phone: str) -> str:

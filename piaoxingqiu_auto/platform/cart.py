@@ -16,7 +16,6 @@ from piaoxingqiu_auto.domain.combo import (
 )
 from piaoxingqiu_auto.domain.models import (
     AudienceConfig,
-    purchase_unit,
     required_audience_count,
 )
 from piaoxingqiu_auto.domain.seating import Candidate, SeatSelection
@@ -47,14 +46,13 @@ class CartRejected(RuntimeError):
 @dataclass(frozen=True)
 class OrderSummary:
     quantity: int
-    unit: str
     plans: tuple[str, ...]
     total: str
     discount: bool
 
     def describe(self) -> str:
         details = [
-            f"目标 {self.quantity} {self.unit}",
+            f"目标 {self.quantity} 张",
             f"票档：{'、'.join(self.plans)}",
         ]
         if self.discount:
@@ -70,10 +68,7 @@ class CartOrder:
     summary: OrderSummary
 
 
-@dataclass(frozen=True)
-class _ComboPriceGroup:
-    ticket_ids: tuple[str, ...]
-    discount: float
+_ComboPriceGroup = tuple[tuple[str, float], ...]
 
 
 class CartClient:
@@ -107,7 +102,7 @@ class CartClient:
             self.site.config.purchase.plan_ids,
             inventory.plan_prices,
         )
-        pre_request, price_groups = _seat_preorder(
+        pre_request, price_groups, combo_tag = _seat_preorder(
             scheme,
             inventory.plan_prices,
             show_id,
@@ -118,8 +113,10 @@ class CartClient:
             pre_request,
             audiences,
             len(selection.candidates),
+            len(selection.candidates),
             tuple(dict.fromkeys(item.plan for item in selection.candidates)),
             price_groups,
+            combo_tag,
             inventory.has_activity,
         )
 
@@ -137,9 +134,11 @@ class CartClient:
                 self._version,
             ),
             audiences,
-            selection.quantity,
+            selection.units,
+            selection.ticket_count,
             (selection.plan,),
             (),
+            None,
             selection.has_activity,
         )
 
@@ -155,12 +154,14 @@ class CartClient:
         pre_request: dict,
         configured: tuple[AudienceConfig, ...],
         quantity: int,
+        ticket_count: int,
         plans: tuple[str, ...],
         price_groups: tuple[_ComboPriceGroup, ...],
+        combo_tag: str | None,
         has_activity: bool,
     ) -> CartOrder:
         required = required_audience_count(
-            self.site.config.purchase.real_name_mode, quantity
+            self.site.config.purchase.real_name_mode, ticket_count
         )
         selected = configured[:required]
         if len(selected) != required:
@@ -215,6 +216,7 @@ class CartClient:
             audience_ids,
             self.site.config.purchase.real_name_mode,
             price_groups,
+            combo_tag,
             promotions,
             activity_prices,
         )
@@ -223,7 +225,6 @@ class CartClient:
             selected,
             OrderSummary(
                 quantity,
-                purchase_unit(self.site.config.project.support_seat_picking),
                 plans,
                 _display_money(payload["paymentParam"]["payAmount"]),
                 any(
@@ -521,16 +522,16 @@ def _seat_preorder(
     show_id: str,
     session_id: str,
     ver: str,
-) -> tuple[dict, tuple[_ComboPriceGroup, ...]]:
+) -> tuple[dict, tuple[_ComboPriceGroup, ...], str | None]:
     grouped: OrderedDict[str, list[Candidate]] = OrderedDict()
     for candidate in scheme.singles:
         grouped.setdefault(candidate.plan_id, []).append(candidate)
-    items = []
+    single_items = []
     for plan_id, candidates in grouped.items():
         if plan_id not in prices:
             raise RuntimeError(f"缺少票档 {plan_id} 的公开价格")
         ticket_ids = iter(_ticket_ids(len(candidates)))
-        items.append(
+        single_items.append(
             {
                 "sku": {
                     "qty": len(candidates),
@@ -551,7 +552,8 @@ def _seat_preorder(
             }
         )
 
-    price_groups = []
+    combo_items = []
+    discounted_tickets = []
     by_variant: OrderedDict[str, list[ComboInstance]] = OrderedDict()
     for instance in scheme.combos:
         by_variant.setdefault(instance.variant.sku_id, []).append(instance)
@@ -561,12 +563,11 @@ def _seat_preorder(
         for instance in instances:
             ticket_ids = _ticket_ids(len(instance.candidates))
             group_id = _ticket_ids(1)[0]
-            price_groups.append(
-                _ComboPriceGroup(
-                    tuple(ticket_ids),
-                    prices[variant.base_id] * len(instance.candidates)
-                    - variant.price,
-                )
+            discount = (
+                prices[variant.base_id] * len(instance.candidates) - variant.price
+            )
+            discounted_tickets.extend(
+                zip(ticket_ids, _split_discount(discount, len(ticket_ids)))
             )
             tickets.extend(
                 {
@@ -579,7 +580,7 @@ def _seat_preorder(
                 }
                 for candidate, ticket_id in zip(instance.candidates, ticket_ids)
             )
-        items.append(
+        combo_items.append(
             {
                 "sku": {
                     "qty": len(instances),
@@ -591,7 +592,13 @@ def _seat_preorder(
                 "spu": {"sessionId": session_id, "showId": show_id},
             }
         )
-    return _base_request(items, ver), tuple(price_groups)
+    price_groups = (tuple(discounted_tickets),) if discounted_tickets else ()
+    combo_tag = (
+        "COMBO"
+        if any(item.variant.display_tag == "COMBO" for item in scheme.combos)
+        else "DISCOUNT" if scheme.combos else None
+    )
+    return _base_request(combo_items + single_items, ver), price_groups, combo_tag
 
 
 def _general_preorder(
@@ -600,17 +607,34 @@ def _general_preorder(
     session_id: str,
     ver: str,
 ) -> dict:
+    ticket_ids = iter(_ticket_ids(selection.ticket_count))
+    tickets = []
+    if selection.combo_items:
+        for _ in range(selection.units):
+            seat_group_id = _ticket_ids(1)[0]
+            for plan_id, count in selection.combo_items:
+                tickets.extend(
+                    {
+                        "comboItemId": plan_id,
+                        "groupId": "default",
+                        "id": next(ticket_ids),
+                        "seatGroupId": seat_group_id,
+                    }
+                    for _ in range(count)
+                )
+    else:
+        tickets.extend(
+            {"groupId": "default", "id": ticket_id}
+            for ticket_id in ticket_ids
+        )
     return _base_request(
         [
             {
                 "sku": {
                     "qty": selection.units,
                     "skuId": selection.plan_id,
-                    "skuType": "SINGLE",
-                    "ticketItems": [
-                        {"groupId": "default", "id": ticket_id}
-                        for ticket_id in _ticket_ids(selection.quantity)
-                    ],
+                    "skuType": "COMBO" if selection.combo_items else "SINGLE",
+                    "ticketItems": tickets,
                     "ticketPrice": _number(selection.price),
                 },
                 "spu": {"sessionId": session_id, "showId": show_id},
@@ -627,6 +651,7 @@ def _create_payload(
     audience_ids: list[str],
     real_name_mode: str,
     groups: tuple[_ComboPriceGroup, ...],
+    combo_tag: str | None,
     promotions: dict | None,
     activity_prices: list[dict],
 ) -> dict:
@@ -663,7 +688,9 @@ def _create_payload(
                     "priceItemTitle": price["priceItemName"],
                 }
             )
-            param["tag"] = "COMBO"
+            if combo_tag is None:
+                raise RuntimeError("FREE_COMBO 缺少官方显示类型")
+            param["tag"] = combo_tag
     ticket_total = next(
         item for item in prices if item["priceItemType"] == "TICKET_FEE"
     )
@@ -753,19 +780,16 @@ def _combo_applications(
     ticket_index: dict[str, tuple[dict, dict, str, float]],
     actual_discount: float,
 ) -> list[list[dict]]:
-    expected = sum(group.discount for group in groups)
+    expected = sum(discount for group in groups for _, discount in group)
     if not groups or abs(expected - actual_discount) > 0.02:
         raise RuntimeError("FREE_COMBO 优惠与预下单结果不一致")
-    applications = []
-    for group in groups:
-        ticket_discounts = _split_discount(group.discount, len(group.ticket_ids))
-        applications.append(
-            [
-                _discount_ticket(ticket_index[ticket_id], discount)
-                for ticket_id, discount in zip(group.ticket_ids, ticket_discounts)
-            ]
-        )
-    return applications
+    return [
+        [
+            _discount_ticket(ticket_index[ticket_id], discount)
+            for ticket_id, discount in group
+        ]
+        for group in groups
+    ]
 
 
 def _discount_ticket(

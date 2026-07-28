@@ -86,10 +86,16 @@ def _cache_put(
 class GeneralAdmissionSelection:
     plan: str
     plan_id: str
-    quantity: int
     units: int
     price: float
     has_activity: bool
+    combo_items: tuple[tuple[str, int], ...]
+
+    @property
+    def ticket_count(self) -> int:
+        return self.units * (
+            sum(count for _, count in self.combo_items) if self.combo_items else 1
+        )
 
 
 @dataclass(frozen=True)
@@ -152,23 +158,27 @@ class GeneralAdmissionInventory:
             if not item or not item.get("saleStarted"):
                 continue
             can_buy = int(item.get("canBuyCount") or 0)
-            unit_qty = max(1, int(item.get("unitQty") or 1))
-            units = min(can_buy, quantity // unit_qty)
+            combo = (
+                bool(item.get("isCombo"))
+                or item.get("seatPlanCategory") == "COMBO"
+            ) and item.get("seatPlanCategory") != "FREE_COMBO"
+            combo_items = _fixed_combo_items(item) if combo else ()
+            units = min(can_buy, quantity)
             if units > 0:
                 options.append(
                     GeneralAdmissionSelection(
                         plan=name,
                         plan_id=plan_id,
-                        quantity=units * unit_qty,
                         units=units,
                         price=float(item.get("originalPrice") or 0),
                         has_activity=bool(item.get("hasActivity")),
+                        combo_items=combo_items,
                     )
                 )
         if not options:
             raise InventoryUnavailable("配置票档当前均没有可售票")
-        full = next((option for option in options if option.quantity == quantity), None)
-        return full or max(options, key=lambda option: option.quantity)
+        full = next((option for option in options if option.units == quantity), None)
+        return full or max(options, key=lambda option: option.units)
 
     async def wait_available(self, quantity: int) -> GeneralAdmissionSelection:
         return await _wait_inventory(lambda: self.refresh(quantity))
@@ -626,6 +636,21 @@ def _plan_bits(record: dict[str, Any], plan_id: str) -> bytes:
             value = str(item.get("bitstr") or "")
             return base64.b64decode(value + "=" * (-len(value) % 4))
     return b""
+
+
+def _fixed_combo_items(plan: dict[str, Any]) -> tuple[tuple[str, int], ...]:
+    items = tuple(
+        (
+            str(item.get("bizSeatPlanId") or ""),
+            max(1, int(item.get("unitQty") or 1)),
+        )
+        for item in plan.get("items", [])
+        if isinstance(item, dict) and item.get("bizSeatPlanId")
+    )
+    unit_qty = max(1, int(plan.get("unitQty") or 1))
+    if not items or sum(count for _, count in items) != unit_qty:
+        raise RuntimeError("固定套票组成与官方 unitQty 不一致")
+    return items
 
 
 def _response_data(payload: Any, label: str) -> Any:

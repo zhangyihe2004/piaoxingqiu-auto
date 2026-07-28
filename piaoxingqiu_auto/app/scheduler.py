@@ -22,7 +22,6 @@ from piaoxingqiu_auto.app.run_config import build_login_config, build_order_conf
 from piaoxingqiu_auto.domain.models import (
     AccountRunConfig,
     SystemConfig,
-    purchase_unit,
 )
 from piaoxingqiu_auto.app.database import Database
 from piaoxingqiu_auto.adapters.feishu_gateway import FeishuGateway
@@ -303,7 +302,6 @@ class TaskScheduler:
             self.available_plans[task_id] = current
             return
         available = [plan for plan in plans if str(plan["seat_plan_id"]) in added]
-        unit = purchase_unit(bool(task["support_seat_picking"]))
         self._send_notice(
             task_id,
             PendingNotice(
@@ -316,7 +314,7 @@ class TaskScheduler:
                         *(
                             f"· {plan['plan_name']}：最多可买 "
                             f"{plan['can_buy_count'] * plan['unit_qty'] if task['support_seat_picking'] else plan['can_buy_count']} "
-                            f"{unit}"
+                            "张"
                             for plan in available
                         ),
                     )

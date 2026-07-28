@@ -4,7 +4,11 @@ import sqlite3
 import time
 from pathlib import Path
 
-from piaoxingqiu_auto.domain.models import account_key, required_audience_count
+from piaoxingqiu_auto.domain.models import (
+    account_key,
+    purchase_unit_qty,
+    required_audience_count,
+)
 
 
 _UNCHANGED = object()
@@ -458,8 +462,10 @@ class Database:
             if int(binding["quantity"]) < 1:
                 raise ValueError("目标数量已完成，请重新绑定并设置数量")
             people = self.get_binding_audiences(task_id, account_id)
+            plans = self.get_binding_plans(task_id, account_id)
+            ticket_count = int(binding["quantity"]) * purchase_unit_qty(plans)
             required = required_audience_count(
-                task["real_name_mode"], int(binding["quantity"])
+                task["real_name_mode"], ticket_count
             )
             if len(people) != required:
                 raise ValueError("绑定观演人配置不完整")
@@ -573,15 +579,23 @@ class Database:
             binding = self.get_binding(task_id, account_id)
             if binding and binding["status"] == "RUNNING":
                 raise ValueError("绑定正在抢票，当前不能修改")
-            maximum = max(1, int(task["session_limitation"]))
+            known_plans = {
+                row["seat_plan_id"]: row for row in self.get_task_plans(task_id)
+            }
+            if not set(plan_ids) <= known_plans.keys():
+                raise ValueError("票档包含其他场次或已失效的编号")
+            selected_plans = [known_plans[plan_id] for plan_id in plan_ids]
+            unit_qty = purchase_unit_qty(selected_plans)
+            maximum = int(task["session_limitation"]) // unit_qty
+            if maximum < 1:
+                raise ValueError("固定套票张数超过当前场次限购")
             if not 1 <= quantity <= maximum:
                 raise ValueError(f"购票数量必须在 1~{maximum} 之间")
-            required = required_audience_count(task["real_name_mode"], quantity)
+            required = required_audience_count(
+                task["real_name_mode"], quantity * unit_qty
+            )
             if len(people) != required:
                 raise ValueError(f"当前实名规则需要配置 {required} 位观演人")
-            known = {row["seat_plan_id"] for row in self.get_task_plans(task_id)}
-            if not set(plan_ids) <= known:
-                raise ValueError("票档包含其他场次或已失效的编号")
             if masked_ids:
                 placeholders = ",".join("?" for _ in masked_ids)
                 conflict = self.connection.execute(
