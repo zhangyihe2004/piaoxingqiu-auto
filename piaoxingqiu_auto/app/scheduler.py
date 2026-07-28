@@ -901,7 +901,7 @@ class TaskScheduler:
             "NEEDS_LOGIN": "下一步：登录",
             "COMPLETE": f"下一步：绑定 {task_id} {account_id}",
             "STOP_BINDING": (
-                f"下一步：处理风控后发送：启动 {task_id} {account_id}"
+                f"下一步：处理上述问题后发送：启动 {task_id} {account_id}"
             ),
         }.get(result.status, "状态：该绑定保持启动，将自动继续等待。")
         body = (
