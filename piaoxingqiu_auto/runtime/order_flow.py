@@ -242,6 +242,7 @@ async def _run_account(
         raise RuntimeError("准备阶段出现意外创建请求，已拦截并停止")
 
     attempt = 0
+    rebuilt = False
     while True:
         attempt += 1
 
@@ -306,7 +307,11 @@ async def _run_account(
                 removed_audiences=tuple(removed),
                 fulfilled_quantity=fulfilled_quantity,
             )
-        recovery = action
+        if action == "REBUILD":
+            if rebuilt:
+                action = "FAILED"
+            else:
+                rebuilt = True
         if action == "FAILED":
             await _save_failure(site, config, "create-failed")
             return RunResult(
@@ -315,6 +320,7 @@ async def _run_account(
                 removed_audiences=tuple(removed),
                 fulfilled_quantity=fulfilled_quantity,
             )
+        recovery = action
 
         if action == "RESELECT" and seat_source is not None:
             seat_source.reject(selection)
