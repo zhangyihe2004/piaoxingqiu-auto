@@ -651,11 +651,12 @@ def _create_payload(
             param.update(
                 {
                     "applyTickets": applications,
-                    "tag": "COMBO",
                     "discountId": "comboDiscount",
                     "priceItemTitle": price["priceItemName"],
                 }
             )
+            if tag := price.get("tag"):
+                param["tag"] = tag
     ticket_total = next(
         item for item in prices if item["priceItemType"] == "TICKET_FEE"
     )
