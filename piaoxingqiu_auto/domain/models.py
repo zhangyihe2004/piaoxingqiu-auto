@@ -75,11 +75,9 @@ class AccountRunConfig:
 
 
 def required_audience_count(mode: str, quantity: int) -> int:
-    if mode == "NONE":
-        return 0
     if mode == "PER_ORDER":
         return 1
-    return quantity
+    return quantity if mode == "PER_TICKET" else 0
 
 
 def purchase_unit_qty(plans: Iterable[Mapping]) -> int:

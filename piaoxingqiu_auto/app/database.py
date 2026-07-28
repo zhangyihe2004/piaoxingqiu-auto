@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     support_seat_picking INTEGER NOT NULL,
     show_limit INTEGER NOT NULL DEFAULT 0,
     session_limitation INTEGER NOT NULL DEFAULT 1,
-    real_name_mode TEXT NOT NULL DEFAULT 'UNKNOWN',
+    real_name_mode TEXT NOT NULL DEFAULT 'NONE',
     interval_sec INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',
     session_status TEXT NOT NULL DEFAULT '',

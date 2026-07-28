@@ -260,7 +260,7 @@ class CommandWorker:
             session=session,
             plans=plans,
             interval=interval,
-            real_name_mode=str(show.get("_real_name_mode") or "UNKNOWN"),
+            real_name_mode=str(show.get("_real_name_mode") or "NONE"),
         )
         if not created:
             return f"该场次已经是任务 #{task_id}，不会重复创建。\n发送：详情 {task_id}"
@@ -367,7 +367,7 @@ class CommandWorker:
                     f"数量：{binding['quantity']} 张",
                     (
                         "观演人：无需配置"
-                        if task["real_name_mode"] == "NONE"
+                        if task["real_name_mode"] not in {"PER_ORDER", "PER_TICKET"}
                         else f"观演人（{len(people)}）："
                     ),
                 )

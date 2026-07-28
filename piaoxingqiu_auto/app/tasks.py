@@ -21,7 +21,6 @@ REAL_NAME_LABELS = {
     "NONE": "无需实名",
     "PER_ORDER": "一单一证",
     "PER_TICKET": "一票一证",
-    "UNKNOWN": "实名规则未识别",
 }
 
 
@@ -62,7 +61,7 @@ def parse_real_name_mode(payload: dict[str, Any]) -> str:
         return "PER_ORDER"
     if "一票一证" in value:
         return "PER_TICKET"
-    return "UNKNOWN"
+    return "NONE"
 
 
 def logical_plans(payload: dict[str, Any]) -> list[dict]:
@@ -110,12 +109,12 @@ class TaskService:
             return_exceptions=True,
         )
         for show, mode in zip(shows, modes):
-            show["_real_name_mode"] = mode if isinstance(mode, str) else "UNKNOWN"
+            show["_real_name_mode"] = mode if isinstance(mode, str) else "NONE"
         return shows
 
     async def real_name_mode(self, show_id: str) -> str:
         if not show_id:
-            return "UNKNOWN"
+            return "NONE"
         return parse_real_name_mode(await self.client.show_static(show_id))
 
     async def show_sessions(self, show_id: str) -> tuple[str, list[dict]]:
@@ -201,4 +200,4 @@ class TaskService:
 
 
 def real_name_label(mode: str) -> str:
-    return REAL_NAME_LABELS.get(mode, REAL_NAME_LABELS["UNKNOWN"])
+    return REAL_NAME_LABELS.get(mode, REAL_NAME_LABELS["NONE"])
