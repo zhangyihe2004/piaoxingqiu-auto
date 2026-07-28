@@ -13,7 +13,6 @@ from piaoxingqiu_auto.platform.order_guard import CART_CREATE_PATH, is_create_ur
 
 
 CREATE_FAILURE_ACTIONS = {
-    "10032001": "RETRY",
     "22035010": "RESELECT",
     "23502000": "RESELECT",
     "22039998": "REBUILD",

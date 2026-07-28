@@ -104,6 +104,7 @@ class CartClient:
             selection,
             inventory.combo_plans,
             self.site.config.purchase.plan_ids,
+            inventory.plan_prices,
         )
         pre_request, price_groups = _seat_preorder(
             scheme,
@@ -490,7 +491,7 @@ def _ticket_ids(count: int) -> list[str]:
 def _base_request(items: list[dict], ver: str) -> dict:
     return {
         "clientCurrency": "CNY",
-        "couponQueryParam": {"src": "H5", "onlySearchCanUse": False},
+        "couponQueryParam": {"src": "WEB", "onlySearchCanUse": False},
         "orderSource": "COMMON",
         "orders": [
             {
@@ -502,7 +503,7 @@ def _base_request(items: list[dict], ver: str) -> dict:
             }
         ],
         "scene": "NORMAL",
-        "src": "H5",
+        "src": "WEB",
         "ver": ver,
     }
 
@@ -768,7 +769,7 @@ def _discount_ticket(
     ticket, spu, sku_id, _ = indexed
     result = {
         "id": ticket["id"],
-        "discountAmount": _money(discount),
+        "discountAmount": _display_money(discount),
         "seatPlanId": sku_id,
         "showId": spu["showId"],
         "sessionId": spu["sessionId"],

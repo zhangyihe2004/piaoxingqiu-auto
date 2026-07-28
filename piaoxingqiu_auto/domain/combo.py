@@ -34,6 +34,7 @@ def seat_order_scheme(
     selection: SeatSelection,
     combo_plans: tuple[dict[str, Any], ...],
     plan_order: tuple[str, ...],
+    plan_prices: dict[str, float],
 ) -> SeatOrderScheme:
     grouped: dict[str, list[Candidate]] = {plan_id: [] for plan_id in plan_order}
     for candidate in selection.candidates:
@@ -52,7 +53,7 @@ def seat_order_scheme(
     combo_units = tuple(
         unit
         for plan_id, quantity in counts.items()
-        for unit in _best_units(quantity, by_base[plan_id])
+        for unit in _best_units(quantity, by_base[plan_id], plan_prices[plan_id])
     )
     pools = {
         plan_id: iter(
@@ -104,18 +105,15 @@ def _variants(
         base_id, item_quantity = next(iter(components.items()))
         if base_id not in wanted:
             continue
-        quantity = int(plan.get("unitQty") or item_quantity)
-        if quantity != item_quantity:
-            continue
         price = float(plan.get("originalPrice") or 0)
         capacity = int(plan.get("canBuyCount") or 0)
-        if not plan.get("seatPlanId") or price <= 0:
+        if not plan.get("seatPlanId") or price <= 0 or capacity <= 0:
             continue
         result.append(
             ComboVariant(
                 sku_id=str(plan["seatPlanId"]),
                 base_id=base_id,
-                quantity=quantity,
+                quantity=item_quantity,
                 price=price,
                 capacity=capacity,
             )
@@ -126,6 +124,7 @@ def _variants(
 def _best_units(
     quantity: int,
     variants: tuple[ComboVariant, ...],
+    base_price: float,
 ) -> tuple[tuple[ComboVariant, int], ...]:
     best_score: tuple | None = None
     best: tuple[tuple[ComboVariant, int], ...] = ()
@@ -138,10 +137,20 @@ def _best_units(
     ) -> None:
         nonlocal best_score, best
         if index == len(variants):
+            sizes = sorted(
+                (
+                    item.quantity
+                    for item, units in chosen
+                    for _ in range(units)
+                ),
+                reverse=True,
+            )
+            exact = len(chosen) == 1 and chosen[0][1] == 1 and remaining == 0
             score = (
-                remaining,
-                round(price, 2),
-                -sum(units for _, units in chosen),
+                not exact,
+                round(price + remaining * base_price, 2),
+                tuple(-size for size in sizes)
+                + (0,) * (quantity - len(sizes)),
                 tuple((item.sku_id, units) for item, units in chosen),
             )
             if best_score is None or score < best_score:

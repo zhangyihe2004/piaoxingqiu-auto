@@ -132,7 +132,7 @@ def request_context(headers: dict[str, str] | None = None) -> dict[str, str]:
     return {
         "lang": "zh",
         "utcOffset": headers.get("utc-offset", "480"),
-        "terminalSrc": headers.get("terminal-src", "H5"),
+        "terminalSrc": headers.get("terminal-src", "WEB"),
         "ver": headers.get("ver", "4.63.3"),
         "currency": "CNY",
     }
