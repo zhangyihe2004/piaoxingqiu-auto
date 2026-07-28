@@ -28,6 +28,7 @@ PRE_ORDER_PATH = "/cyy_gatewayapi/trade/buyer/order/cart/v1/pre_order"
 CREATE_ORDER_PATH = "/cyy_gatewayapi/trade/buyer/order/cart/v1/create_order"
 POSITIONING_PATH = "/cyy_gatewayapi/mcommon/pub/v1/positioning"
 PROMOTIONS_PATH = "/cyy_gatewayapi/show/pub/v3/promotions/list"
+_LAST_TICKET_TIMESTAMP = 0
 
 
 class CartRejected(RuntimeError):
@@ -481,11 +482,17 @@ def _scalar(value: object, *keys: str) -> str | None:
 
 
 def _ticket_ids(count: int) -> list[str]:
-    prefix = str(int(time.time() * 1000))
-    values: set[str] = set()
-    while len(values) < count:
-        values.add(f"{prefix}{secrets.randbelow(1_000_000_000):09d}")
-    return list(values)
+    global _LAST_TICKET_TIMESTAMP
+    values = []
+    for _ in range(count):
+        _LAST_TICKET_TIMESTAMP = max(
+            int(time.time() * 1000),
+            _LAST_TICKET_TIMESTAMP + 1,
+        )
+        values.append(
+            f"{_LAST_TICKET_TIMESTAMP}10000000{secrets.randbelow(9) + 1}"
+        )
+    return values
 
 
 def _base_request(items: list[dict], ver: str) -> dict:
