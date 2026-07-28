@@ -89,13 +89,11 @@ class GeneralAdmissionSelection:
     units: int
     price: float
     has_activity: bool
-    combo_items: tuple[tuple[str, int], ...]
+    combo_items: tuple[tuple[str, int, float], ...]
 
     @property
     def ticket_count(self) -> int:
-        return self.units * (
-            sum(count for _, count in self.combo_items) if self.combo_items else 1
-        )
+        return self.units * (sum(item[1] for item in self.combo_items) or 1)
 
 
 @dataclass(frozen=True)
@@ -638,17 +636,22 @@ def _plan_bits(record: dict[str, Any], plan_id: str) -> bytes:
     return b""
 
 
-def _fixed_combo_items(plan: dict[str, Any]) -> tuple[tuple[str, int], ...]:
+def _fixed_combo_items(plan: dict[str, Any]) -> tuple[tuple[str, int, float], ...]:
     items = tuple(
         (
             str(item.get("bizSeatPlanId") or ""),
             max(1, int(item.get("unitQty") or 1)),
+            float(item.get("originalPrice") or 0),
         )
         for item in plan.get("items", [])
         if isinstance(item, dict) and item.get("bizSeatPlanId")
     )
     unit_qty = max(1, int(plan.get("unitQty") or 1))
-    if not items or sum(count for _, count in items) != unit_qty:
+    if (
+        not items
+        or sum(count for _, count, _ in items) != unit_qty
+        or sum(count * price for _, count, price in items) <= 0
+    ):
         raise RuntimeError("固定套票组成与官方 unitQty 不一致")
     return items
 

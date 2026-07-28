@@ -126,19 +126,20 @@ class CartClient:
         audiences: tuple[AudienceConfig, ...],
     ) -> CartOrder:
         show_id, session_id = self.site.booking_ids
+        pre_request, price_groups, combo_tag = _general_preorder(
+            selection,
+            show_id,
+            session_id,
+            self._version,
+        )
         return await self._prepare(
-            _general_preorder(
-                selection,
-                show_id,
-                session_id,
-                self._version,
-            ),
+            pre_request,
             audiences,
             selection.units,
             selection.ticket_count,
             (selection.plan,),
-            (),
-            None,
+            price_groups,
+            combo_tag,
             selection.has_activity,
         )
 
@@ -567,7 +568,7 @@ def _seat_preorder(
                 prices[variant.base_id] * len(instance.candidates) - variant.price
             )
             discounted_tickets.extend(
-                zip(ticket_ids, _split_discount(discount, len(ticket_ids)))
+                zip(ticket_ids, _split_discount(discount, [1] * len(ticket_ids)))
             )
             tickets.extend(
                 {
@@ -606,42 +607,55 @@ def _general_preorder(
     show_id: str,
     session_id: str,
     ver: str,
-) -> dict:
+) -> tuple[dict, tuple[_ComboPriceGroup, ...], str | None]:
     ticket_ids = iter(_ticket_ids(selection.ticket_count))
     tickets = []
+    discounted_tickets = []
     if selection.combo_items:
+        components = [
+            (plan_id, price)
+            for plan_id, count, price in selection.combo_items
+            for _ in range(count)
+        ]
+        discounts = _split_discount(
+            sum(price for _, price in components) - selection.price,
+            [price for _, price in components],
+        )
         for _ in range(selection.units):
             seat_group_id = _ticket_ids(1)[0]
-            for plan_id, count in selection.combo_items:
-                tickets.extend(
-                    {
-                        "comboItemId": plan_id,
-                        "groupId": "default",
-                        "id": next(ticket_ids),
-                        "seatGroupId": seat_group_id,
-                    }
-                    for _ in range(count)
-                )
+            unit_ticket_ids = [next(ticket_ids) for _ in components]
+            tickets.extend(
+                {
+                    "comboItemId": plan_id,
+                    "groupId": "default",
+                    "id": ticket_id,
+                    "seatGroupId": seat_group_id,
+                }
+                for (plan_id, _), ticket_id in zip(components, unit_ticket_ids)
+            )
+            discounted_tickets.extend(
+                zip(unit_ticket_ids, discounts)
+            )
     else:
         tickets.extend(
             {"groupId": "default", "id": ticket_id}
             for ticket_id in ticket_ids
         )
-    return _base_request(
-        [
-            {
-                "sku": {
-                    "qty": selection.units,
-                    "skuId": selection.plan_id,
-                    "skuType": "COMBO" if selection.combo_items else "SINGLE",
-                    "ticketItems": tickets,
-                    "ticketPrice": _number(selection.price),
-                },
-                "spu": {"sessionId": session_id, "showId": show_id},
-            }
-        ],
+    request = _base_request(
+        [{
+            "sku": {
+                "qty": selection.units,
+                "skuId": selection.plan_id,
+                "skuType": "COMBO" if selection.combo_items else "SINGLE",
+                "ticketItems": tickets,
+                "ticketPrice": _number(selection.price),
+            },
+            "spu": {"sessionId": session_id, "showId": show_id},
+        }],
         ver,
     )
+    groups = (tuple(discounted_tickets),) if discounted_tickets else ()
+    return request, groups, "COMBO" if groups else None
 
 
 def _create_payload(
@@ -815,12 +829,22 @@ def _discount_ticket(
     return result
 
 
-def _split_discount(total: float, count: int) -> list[float]:
-    if count < 1:
-        raise RuntimeError("套票中没有有效票")
+def _split_discount(total: float, weights: list[float]) -> list[float]:
     cents = round(total * 100)
-    value, remainder = divmod(cents, count)
-    return [(value + (index < remainder)) / 100 for index in range(count)]
+    weight_cents = [round(weight * 100) for weight in weights]
+    total_weight = sum(weight_cents)
+    if cents < 0 or not weights or total_weight < 1:
+        raise RuntimeError("套票优惠数据无效")
+    divided = [divmod(cents * weight, total_weight) for weight in weight_cents]
+    values = [value for value, _ in divided]
+    remainder = cents - sum(values)
+    for index in sorted(
+        range(len(values)),
+        key=lambda item: divided[item][1],
+        reverse=True,
+    )[:remainder]:
+        values[index] += 1
+    return [value / 100 for value in values]
 
 
 def _create_item(
