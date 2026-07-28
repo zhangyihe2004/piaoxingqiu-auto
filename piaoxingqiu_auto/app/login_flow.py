@@ -134,9 +134,7 @@ class FeishuLoginManager:
             for session in expired:
                 await self._drop(session, release=session.release_on_failure)
                 if session.account_id and not session.release_on_failure:
-                    self.db.set_account_status(
-                        session.account_id, "NEEDS_LOGIN"
-                    )
+                    self.db.set_account_status(session.account_id, "NEEDS_LOGIN")
                 if session.last_message_id:
                     detail = (
                         "新手机号占用已释放。"
@@ -158,7 +156,6 @@ class FeishuLoginManager:
         if account:
             session.account_id = int(account["id"])
             await self.cancel_account_worker(account["id"])
-            self.db.set_account_status(account["id"], "NEEDS_LOGIN")
         else:
             # 唯一性必须先在 BEGIN IMMEDIATE 中确定；此行之前没有包含手机号的网络请求。
             account = self.db.reserve_account(phone)
@@ -172,6 +169,7 @@ class FeishuLoginManager:
         account,
         phone: str,
     ) -> str:
+        account_id = int(account["id"])
         browser = build_browser_config(account, self.system)
         manager = persistent_browser(browser)
         context = await manager.__aenter__()
@@ -182,19 +180,20 @@ class FeishuLoginManager:
         entry = await _wait_unique(
             page.locator(".user-icon-wrap:visible"), "票星球账号入口"
         )
-        trigger = await _wait_unique(
-            entry.locator(".login-title:visible"), "票星球登录状态"
+        status = await _wait_unique(
+            entry.locator(".login-title:visible, .user-nickname:visible"),
+            "票星球登录状态",
         )
-        if (await trigger.inner_text()).strip() != "立即登录":
-            assert session.account_id is not None
-            account_id = session.account_id
+        if "user-nickname" in (await status.get_attribute("class") or "").split():
             self.db.set_account_status(account_id, "READY")
             await self._drop(session, release=False)
             return (
                 f"账号 #{account_id} 当前登录状态仍然有效，无需重新验证。"
                 f"{self._configuration_prompt(account_id)}"
             )
-        await trigger.evaluate("element => element.click()")
+        await _require_text(status, "立即登录", "票星球登录状态")
+        self.db.set_account_status(account_id, "NEEDS_LOGIN")
+        await status.evaluate("element => element.click()")
         login = await _wait_unique(
             page.locator(".global-login-popup:visible"), "登录弹层"
         )
