@@ -63,7 +63,7 @@ def parse_real_name_mode(payload: dict[str, Any]) -> str:
         return "PER_TICKET"
     if any(
         isinstance(entry, dict) and entry.get("code") == "REAL_NAME_TICKET"
-        for entry in payload.get("descInfo", {}).get("noteInfos", [])
+        for entry in payload.get("noteInfos", [])
     ):
         return "PER_TICKET"
     return "NONE"
