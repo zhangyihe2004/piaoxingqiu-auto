@@ -498,7 +498,7 @@ def _ticket_ids(count: int) -> list[str]:
 def _base_request(items: list[dict], ver: str) -> dict:
     return {
         "clientCurrency": "CNY",
-        "couponQueryParam": {"src": "WEB", "onlySearchCanUse": False},
+        "couponQueryParam": {"src": "H5", "onlySearchCanUse": False},
         "orderSource": "COMMON",
         "orders": [
             {
@@ -510,7 +510,7 @@ def _base_request(items: list[dict], ver: str) -> dict:
             }
         ],
         "scene": "NORMAL",
-        "src": "WEB",
+        "src": "H5",
         "ver": ver,
     }
 
@@ -663,8 +663,7 @@ def _create_payload(
                     "priceItemTitle": price["priceItemName"],
                 }
             )
-            if tag := price.get("tag"):
-                param["tag"] = tag
+            param["tag"] = "COMBO"
     ticket_total = next(
         item for item in prices if item["priceItemType"] == "TICKET_FEE"
     )
