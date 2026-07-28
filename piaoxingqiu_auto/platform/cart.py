@@ -610,7 +610,6 @@ def _general_preorder(
 ) -> tuple[dict, tuple[_ComboPriceGroup, ...], str | None]:
     ticket_ids = iter(_ticket_ids(selection.ticket_count))
     tickets = []
-    discounted_tickets = []
     if selection.combo_items:
         components = [
             (plan_id, price)
@@ -621,26 +620,27 @@ def _general_preorder(
             sum(price for _, price in components) - selection.price,
             [price for _, price in components],
         )
-        for _ in range(selection.units):
-            seat_group_id = _ticket_ids(1)[0]
-            unit_ticket_ids = [next(ticket_ids) for _ in components]
-            tickets.extend(
-                {
+        seat_group_ids = _ticket_ids(selection.units)
+        unit_groups = [[] for _ in range(selection.units)]
+        for (plan_id, _), discount in zip(components, discounts):
+            for unit, seat_group_id in enumerate(seat_group_ids):
+                ticket_id = next(ticket_ids)
+                tickets.append({
                     "comboItemId": plan_id,
                     "groupId": "default",
                     "id": ticket_id,
                     "seatGroupId": seat_group_id,
-                }
-                for (plan_id, _), ticket_id in zip(components, unit_ticket_ids)
-            )
-            discounted_tickets.extend(
-                zip(unit_ticket_ids, discounts)
-            )
+                })
+                unit_groups[unit].append((ticket_id, discount))
+        groups = (
+            tuple(item for group in unit_groups for item in group),
+        )
     else:
         tickets.extend(
             {"groupId": "default", "id": ticket_id}
             for ticket_id in ticket_ids
         )
+        groups = ()
     request = _base_request(
         [{
             "sku": {
@@ -654,7 +654,6 @@ def _general_preorder(
         }],
         ver,
     )
-    groups = (tuple(discounted_tickets),) if discounted_tickets else ()
     return request, groups, "COMBO" if groups else None
 
 

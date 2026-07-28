@@ -639,12 +639,12 @@ def _plan_bits(record: dict[str, Any], plan_id: str) -> bytes:
 def _fixed_combo_items(plan: dict[str, Any]) -> tuple[tuple[str, int, float], ...]:
     items = tuple(
         (
-            str(item.get("bizSeatPlanId") or ""),
+            str(item.get("stdSeatPlanId") or ""),
             max(1, int(item.get("unitQty") or 1)),
             float(item.get("originalPrice") or 0),
         )
         for item in plan.get("items", [])
-        if isinstance(item, dict) and item.get("bizSeatPlanId")
+        if isinstance(item, dict) and item.get("stdSeatPlanId")
     )
     unit_qty = max(1, int(plan.get("unitQty") or 1))
     if (
