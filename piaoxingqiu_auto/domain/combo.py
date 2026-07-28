@@ -45,7 +45,7 @@ def seat_order_scheme(
         plan_id: tuple(
             sorted(
                 (item for item in variants if item.base_id == plan_id),
-                key=lambda item: item.sku_id,
+                key=lambda item: (-item.quantity, item.sku_id),
             )
         )
         for plan_id in counts
