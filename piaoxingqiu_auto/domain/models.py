@@ -34,6 +34,7 @@ class PurchaseConfig:
     plans: tuple[str, ...]
     plan_ids: tuple[str, ...]
     quantity: int
+    unit_qty: int
     real_name_mode: str
     audiences: tuple[AudienceConfig, ...]
 
@@ -67,6 +68,7 @@ class AccountRunConfig:
                 *self.purchase.plans,
                 *self.purchase.plan_ids,
                 str(self.purchase.quantity),
+                str(self.purchase.unit_qty),
                 self.purchase.real_name_mode,
                 *(f"{a.name}|{a.masked_id}" for a in self.purchase.audiences),
             )

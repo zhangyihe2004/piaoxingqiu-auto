@@ -145,12 +145,14 @@ async def _run_account(
     seat_source: Inventory | None = None
     general_source: GeneralAdmissionInventory | None = None
     people = config.purchase.audiences
-    ticket_quantity = config.purchase.quantity
+    order_quantity = config.purchase.quantity
+    unit_qty = config.purchase.unit_qty
     removed: list[str] = []
     fulfilled_quantity = 0
 
     try:
         if config.project.support_seat_picking:
+            ticket_quantity = order_quantity * unit_qty
             seat_source, selection = await _prepare_seat_selection(
                 site,
                 auth,
@@ -170,7 +172,7 @@ async def _run_account(
                 site,
             )
             selected_ticket_count = len(selection.candidates)
-            selected_order_quantity = selected_ticket_count
+            selected_order_quantity = selected_ticket_count // unit_qty
         else:
             if prewarm:
                 await cart.warm(people)
@@ -179,9 +181,9 @@ async def _run_account(
             general_source = GeneralAdmissionInventory.open(site, auth)
             timings.begin(1)
             load = (
-                general_source.wait_available(ticket_quantity)
+                general_source.wait_available(order_quantity)
                 if prewarm
-                else general_source.refresh(ticket_quantity)
+                else general_source.refresh(order_quantity)
             )
             if prewarm:
                 selection = await _measure(timings, "general_inventory", load)
@@ -195,7 +197,7 @@ async def _run_account(
                 general_source,
                 selection,
                 people,
-                ticket_quantity,
+                order_quantity,
                 site,
             )
             selected_ticket_count = selection.ticket_count
@@ -344,13 +346,13 @@ async def _run_account(
                 )
             removed.extend(item for item in purchased if item not in removed)
             per_order = len(selected_people) == 1 and selected_ticket_count > 1
-            completed = ticket_quantity if per_order else len(purchased)
+            completed = order_quantity if per_order else len(purchased)
             fulfilled_quantity += completed
-            ticket_quantity -= completed
+            order_quantity -= completed
             people = tuple(
                 person for person in people if person.masked_id not in purchased
             )
-            if ticket_quantity <= 0:
+            if order_quantity <= 0:
                 return RunResult(
                     "COMPLETE",
                     "配置目标对应的证件已购买，本次不再创建订单",
@@ -376,6 +378,7 @@ async def _run_account(
                     raise RuntimeError("选座库存状态无效")
                 if recovery == "REBUILD":
                     await site.open_purchase()
+                ticket_quantity = order_quantity * unit_qty
                 selection = await seat_source.refresh(ticket_quantity)
                 selection, prepared = await _prepare_seats(
                     cart,
@@ -386,19 +389,19 @@ async def _run_account(
                     site,
                 )
                 selected_ticket_count = len(selection.candidates)
-                selected_order_quantity = selected_ticket_count
+                selected_order_quantity = selected_ticket_count // unit_qty
             else:
                 if general_source is None:
                     raise RuntimeError("票档库存状态无效")
                 if recovery == "REBUILD":
                     await site.open_purchase()
-                selection = await general_source.refresh(ticket_quantity)
+                selection = await general_source.refresh(order_quantity)
                 selection, prepared = await _prepare_general(
                     cart,
                     general_source,
                     selection,
                     people,
-                    ticket_quantity,
+                    order_quantity,
                     site,
                 )
                 selected_ticket_count = selection.ticket_count

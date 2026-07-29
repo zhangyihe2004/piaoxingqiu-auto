@@ -445,7 +445,7 @@ class Inventory:
             (),
         )
         if not queue:
-            raise RuntimeError("可售座位无法组成有效选择")
+            raise InventoryUnavailable("当前可售座位不足以组成完整套票")
         self.selection_queue = queue
         self.site.record_timing(
             "seat_score", asyncio.get_running_loop().time() - started
