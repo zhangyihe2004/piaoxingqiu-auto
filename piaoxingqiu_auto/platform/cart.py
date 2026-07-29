@@ -742,7 +742,7 @@ def _create_items(
     audience_ids: list[str],
     real_name_mode: str,
     promotions: dict | None,
-) -> tuple[list[dict], dict[str, tuple[dict, dict, str, float]]]:
+) -> tuple[list[dict], dict[str, tuple[dict, dict, str]]]:
     ticket_count = sum(len(item["sku"]["ticketItems"]) for item in order["items"])
     if real_name_mode == "PER_TICKET" and len(audience_ids) != ticket_count:
         raise RuntimeError("观演人数量与票数不一致")
@@ -763,7 +763,6 @@ def _create_items(
                 ticket,
                 item["spu"],
                 item["sku"]["skuId"],
-                float(item["sku"]["ticketPrice"]),
             )
         items.append(
             _create_item(
@@ -801,7 +800,7 @@ def _price_params(prices: list[dict]) -> list[dict]:
 
 def _combo_applications(
     groups: tuple[_ComboPriceGroup, ...],
-    ticket_index: dict[str, tuple[dict, dict, str, float]],
+    ticket_index: dict[str, tuple[dict, dict, str]],
     actual_discount: float,
 ) -> list[list[dict]]:
     expected = sum(discount for group in groups for _, discount in group)
@@ -817,10 +816,10 @@ def _combo_applications(
 
 
 def _discount_ticket(
-    indexed: tuple[dict, dict, str, float],
+    indexed: tuple[dict, dict, str],
     discount: float,
 ) -> dict:
-    ticket, spu, sku_id, _ = indexed
+    ticket, spu, sku_id = indexed
     result = {
         "id": ticket["id"],
         "discountAmount": _display_money(discount),

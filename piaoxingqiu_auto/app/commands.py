@@ -15,7 +15,7 @@ from piaoxingqiu_auto.adapters.feishu_gateway import FeishuGateway, IncomingComm
 from piaoxingqiu_auto.app.login_flow import FeishuLoginManager
 from piaoxingqiu_auto.platform.order_guard import PersistentOrderGuard
 from piaoxingqiu_auto.domain.sale import MIN_INTERVAL, sale_phase
-from piaoxingqiu_auto.app.tasks import TaskService, real_name_label
+from piaoxingqiu_auto.app.tasks import TaskService, quantity_label, real_name_label
 
 
 SEARCH_TTL = 900
@@ -34,7 +34,7 @@ HELP = """票星球自动抢票
 
 【创建】
 搜索 <关键词>
-抢票 <搜索序号> [间隔 <秒>]
+抢票 <搜索序号> [场次序号]
 
 【查看】
 列表
@@ -191,7 +191,7 @@ class CommandWorker:
                     f"{index}. {show.get('showName', '')}",
                     f"时间：{show.get('showDate') or '未知'}",
                     f"地点：{show.get('cityName', '')} {show.get('venueName', '')}".strip(),
-                    f"实名：{real_name_label(show.get('_real_name_mode', 'UNKNOWN'))}",
+                    f"实名：{real_name_label(show.get('_real_name_mode', 'NONE'))}",
                 )
             )
         lines.extend(("", "发送：抢票 <搜索序号>"))
@@ -212,46 +212,29 @@ class CommandWorker:
         return None
 
     async def _create(self, command: IncomingCommand, parts: list[str]) -> str:
-        usage = "发送：抢票 <搜索序号> [间隔 <秒>]"
-        if len(parts) < 2:
-            return usage
+        if len(parts) not in {2, 3}:
+            return "发送：抢票 <搜索序号> [场次序号]"
         show = self._search_show(command, parts[1])
         if not show:
             return "搜索序号无效或结果已过期，请重新搜索。"
-        show_id = str(show.get("showId") or "")
-        options = {"场次": "", "间隔": "60"}
-        interval_given = False
-        index = 2
-        while index < len(parts):
-            if parts[index] not in options or index + 1 >= len(parts):
-                return usage
-            if parts[index] == "间隔":
-                interval_given = True
-            options[parts[index]] = parts[index + 1]
-            index += 2
-        if not options["间隔"].isdigit():
-            return "间隔必须是整数秒。"
-        if options["场次"] and not options["场次"].isdigit():
+        if len(parts) == 3 and not parts[2].isdigit():
             return "场次序号必须是数字。"
-        requested_interval = int(options["间隔"])
+        show_id = str(show.get("showId") or "")
         show_name, sessions = await self.service.show_sessions(show_id)
         if not sessions:
             return "该演出当前没有场次。"
-        if len(sessions) > 1 and not options["场次"]:
+        if len(sessions) > 1 and len(parts) == 2:
             lines = [f"演出：{show_name}", f"场次（{len(sessions)}）："]
             lines.extend(
                 f"{number}. {session.get('sessionName', '')}"
                 for number, session in enumerate(sessions, 1)
             )
-            followup = f"发送：抢票 {parts[1]} 场次 <序号>"
-            if interval_given:
-                followup += f" 间隔 {options['间隔']}"
-            lines.extend(("", followup))
+            lines.extend(("", f"发送：抢票 {parts[1]} <场次序号>"))
             return "\n".join(lines)
-        session_number = int(options["场次"] or "1")
+        session_number = int(parts[2]) if len(parts) == 3 else 1
         if not 1 <= session_number <= len(sessions):
             return f"场次编号必须在 1~{len(sessions)} 之间。"
-        interval = max(MIN_INTERVAL, requested_interval)
+        interval = 60
         session = sessions[session_number - 1]
         plans = await self.service.plans(show_id, session["bizShowSessionId"])
         task_id, created = self.service.create_task(
@@ -264,19 +247,18 @@ class CommandWorker:
         )
         if not created:
             return f"该场次已经是任务 #{task_id}，不会重复创建。\n发送：详情 {task_id}"
-        adjusted = (
-            f"（输入 {requested_interval} 秒，已按最低值调整）"
-            if requested_interval < MIN_INTERVAL
-            else ""
+        quantity_name, quantity_unit = quantity_label(
+            bool(session.get("supportSeatPicking"))
         )
         return (
             f"已创建任务 #{task_id}\n\n"
             f"演出：{show_name}\n"
             f"场次：{session.get('sessionName', '')}\n"
             f"方式：{'选座' if session.get('supportSeatPicking') else '不选座'}\n"
-            f"实名：{real_name_label(show.get('_real_name_mode', 'UNKNOWN'))}\n"
-            f"数量：每个账号 1~{int(session['limitation'])} 张\n"
-            f"间隔：{interval} 秒{adjusted}\n"
+            f"实名：{real_name_label(show.get('_real_name_mode', 'NONE'))}\n"
+            f"{quantity_name}：每个账号 1~{int(session['limitation'])} "
+            f"{quantity_unit}\n"
+            f"间隔：{interval} 秒\n"
             "账号：0\n状态：等待添加账号\n\n"
             f"{self._account_next_step(task_id)}"
         )
@@ -316,13 +298,16 @@ class CommandWorker:
         plans = self.db.get_task_plans(task_id)
         bindings = self.db.list_bindings(task_id=task_id)
         phase = sale_phase(task, plans)
+        quantity_name, quantity_unit = quantity_label(
+            bool(task["support_seat_picking"])
+        )
         lines = [
             f"任务 #{task_id}",
             f"演出：{task['show_name']}",
             f"场次：{task['session_name']}",
             f"方式：{'选座' if task['support_seat_picking'] else '不选座'}",
             f"实名：{real_name_label(task['real_name_mode'])}",
-            f"场次限购：{task['session_limitation']} 张",
+            f"场次限购：{task['session_limitation']} {quantity_unit}",
             f"项目累计限购：{task['show_limit'] or '未提供'}",
             f"状态：{_mode(task, phase)}",
             f"间隔：{task['interval_sec']} 秒",
@@ -334,9 +319,7 @@ class CommandWorker:
                 "未开售"
                 if phase in {"SCHEDULED", "PREWARM", "WAITING"}
                 else (
-                    f"最多可买 "
-                    f"{plan['can_buy_count'] * plan['unit_qty'] if task['support_seat_picking'] else plan['can_buy_count']} "
-                    "张"
+                    f"最多可买 {plan['can_buy_count']} 张"
                 )
                 if plan["sale_started"] and plan["can_buy_count"] > 0
                 else "可售但无票"
@@ -364,7 +347,7 @@ class CommandWorker:
                         if account_plans
                         else "未配置"
                     ),
-                    f"数量：{binding['quantity']} 张",
+                    f"{quantity_name}：{binding['quantity']} {quantity_unit}",
                     (
                         "观演人：无需配置"
                         if task["real_name_mode"] not in {"PER_ORDER", "PER_TICKET"}

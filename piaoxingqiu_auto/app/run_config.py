@@ -22,7 +22,10 @@ def build_order_config(
         AudienceConfig(person["name"], person["masked_id"]) for person in audiences
     )
     quantity = int(binding["quantity"])
-    unit_qty = purchase_unit_qty(plans)
+    unit_qty = purchase_unit_qty(
+        plans,
+        support_seat_picking=bool(task["support_seat_picking"]),
+    )
     if quantity < 1 or len(people) != required_audience_count(
         task["real_name_mode"], quantity * unit_qty
     ):
@@ -34,7 +37,6 @@ def build_order_config(
             tuple(plan["plan_name"] for plan in plans),
             tuple(plan["seat_plan_id"] for plan in plans),
             quantity,
-            unit_qty,
             task["real_name_mode"],
             people,
         ),
@@ -47,7 +49,7 @@ def build_login_config(task, account, system: SystemConfig) -> AccountRunConfig:
     return AccountRunConfig(
         project=_project_config(task),
         purchase=PurchaseConfig(
-            task["session_name"], (), (), 0, 1, task["real_name_mode"], ()
+            task["session_name"], (), (), 0, task["real_name_mode"], ()
         ),
         browser=build_browser_config(account, system),
         create_order=False,

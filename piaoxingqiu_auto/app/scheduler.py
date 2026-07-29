@@ -348,8 +348,7 @@ class TaskScheduler:
                         f"场次：{task['session_name']}",
                         *(
                             f"· {plan['plan_name']}：最多可买 "
-                            f"{plan['can_buy_count'] * plan['unit_qty'] if task['support_seat_picking'] else plan['can_buy_count']} "
-                            "张"
+                            f"{plan['can_buy_count']} 张"
                             for plan in available
                         ),
                     )

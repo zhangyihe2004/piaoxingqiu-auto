@@ -34,7 +34,6 @@ class PurchaseConfig:
     plans: tuple[str, ...]
     plan_ids: tuple[str, ...]
     quantity: int
-    unit_qty: int
     real_name_mode: str
     audiences: tuple[AudienceConfig, ...]
 
@@ -68,7 +67,6 @@ class AccountRunConfig:
                 *self.purchase.plans,
                 *self.purchase.plan_ids,
                 str(self.purchase.quantity),
-                str(self.purchase.unit_qty),
                 self.purchase.real_name_mode,
                 *(f"{a.name}|{a.masked_id}" for a in self.purchase.audiences),
             )
@@ -82,7 +80,13 @@ def required_audience_count(mode: str, quantity: int) -> int:
     return quantity if mode == "PER_TICKET" else 0
 
 
-def purchase_unit_qty(plans: Iterable[Mapping]) -> int:
+def purchase_unit_qty(
+    plans: Iterable[Mapping],
+    *,
+    support_seat_picking: bool,
+) -> int:
+    if support_seat_picking:
+        return 1
     selected = tuple(plans)
     unit_qty = max(
         (max(1, int(plan["unit_qty"])) for plan in selected),

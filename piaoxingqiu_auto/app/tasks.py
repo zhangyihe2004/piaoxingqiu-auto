@@ -206,3 +206,7 @@ class TaskService:
 
 def real_name_label(mode: str) -> str:
     return REAL_NAME_LABELS.get(mode, REAL_NAME_LABELS["NONE"])
+
+
+def quantity_label(support_seat_picking: bool) -> tuple[str, str]:
+    return ("人数", "人") if support_seat_picking else ("数量", "张")

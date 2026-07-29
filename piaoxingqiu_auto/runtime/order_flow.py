@@ -146,13 +146,12 @@ async def _run_account(
     general_source: GeneralAdmissionInventory | None = None
     people = config.purchase.audiences
     order_quantity = config.purchase.quantity
-    unit_qty = config.purchase.unit_qty
     removed: list[str] = []
     fulfilled_quantity = 0
 
     try:
         if config.project.support_seat_picking:
-            ticket_quantity = order_quantity * unit_qty
+            ticket_quantity = order_quantity
             seat_source, selection = await _prepare_seat_selection(
                 site,
                 auth,
@@ -172,11 +171,11 @@ async def _run_account(
                 site,
             )
             selected_ticket_count = len(selection.candidates)
-            selected_order_quantity = selected_ticket_count // unit_qty
+            selected_order_quantity = selected_ticket_count
         else:
             if prewarm:
                 await cart.warm(people)
-                await _wait_signal(sale_signal, "缺少任务级开售观察器")
+                await _wait_sale(sale_signal)
             await acquire_execution()
             general_source = GeneralAdmissionInventory.open(site, auth)
             timings.begin(1)
@@ -378,7 +377,7 @@ async def _run_account(
                     raise RuntimeError("选座库存状态无效")
                 if recovery == "REBUILD":
                     await site.open_purchase()
-                ticket_quantity = order_quantity * unit_qty
+                ticket_quantity = order_quantity
                 selection = await seat_source.refresh(ticket_quantity)
                 selection, prepared = await _prepare_seats(
                     cart,
@@ -389,7 +388,7 @@ async def _run_account(
                     site,
                 )
                 selected_ticket_count = len(selection.candidates)
-                selected_order_quantity = selected_ticket_count // unit_qty
+                selected_order_quantity = selected_ticket_count
             else:
                 if general_source is None:
                     raise RuntimeError("票档库存状态无效")
@@ -457,7 +456,7 @@ async def _prepare_seat_selection(
     bootstrap = InventoryBootstrap.open(site, auth)
     if prewarm:
         await cart.warm(site.config.purchase.audiences)
-        await _wait_signal(sale_signal, "缺少任务级开售观察器")
+        await _wait_sale(sale_signal)
 
     await acquire_execution()
     timings.begin(1)
@@ -540,12 +539,9 @@ async def _prepare_cart(
     raise AssertionError("unreachable")
 
 
-async def _wait_signal(
-    signal: Awaitable[None] | None,
-    missing: str,
-) -> None:
+async def _wait_sale(signal: Awaitable[None] | None) -> None:
     if signal is None:
-        raise SaleUnavailable(missing)
+        raise SaleUnavailable("缺少任务级开售观察器")
     await asyncio.shield(signal)
 
 

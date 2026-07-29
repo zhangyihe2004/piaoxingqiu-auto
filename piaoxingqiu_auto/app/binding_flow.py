@@ -13,7 +13,11 @@ from piaoxingqiu_auto.domain.models import (
 )
 from piaoxingqiu_auto.app.database import Database
 from piaoxingqiu_auto.adapters.feishu_gateway import IncomingCommand
-from piaoxingqiu_auto.app.tasks import parse_numbers, real_name_label
+from piaoxingqiu_auto.app.tasks import (
+    parse_numbers,
+    quantity_label,
+    real_name_label,
+)
 
 
 SESSION_TTL = 1800
@@ -273,16 +277,17 @@ class BindingSetupFlow:
     ) -> str:
         task = self._task(session)
         maximum = self._maximum_quantity(session)
+        label, unit = quantity_label(bool(task["support_seat_picking"]))
         lines = [
             f"绑定任务 #{session.task_id}｜账号 #{session.account_id}（2/3）",
-            "设置数量",
+            f"设置{label}",
         ]
         if notice:
             lines.extend(("", notice))
         lines.extend(
             (
                 "",
-                f"场次限购：最多 {maximum} 张",
+                f"场次限购：最多 {maximum} {unit}",
                 f"实名规则：{real_name_label(task['real_name_mode'])}",
                 f"发送：1~{maximum}",
                 "退出：取消",
@@ -323,9 +328,10 @@ class BindingSetupFlow:
             row["seat_plan_id"]: row["plan_name"] for row in self._task_plans(session)
         }
         task = self._task(session)
+        label, unit = quantity_label(bool(task["support_seat_picking"]))
         lines = [
             f"票档：{' → '.join(plans[item] for item in session.plan_ids)}",
-            f"数量：{session.quantity} 张",
+            f"{label}：{session.quantity} {unit}",
             f"实名：{real_name_label(task['real_name_mode'])}",
         ]
         if session.people:
@@ -349,11 +355,13 @@ class BindingSetupFlow:
         return task
 
     def _required_people(self, session: BindingSetupSession) -> int:
+        task = self._task(session)
         ticket_count = session.quantity * purchase_unit_qty(
-            self._selected_plans(session)
+            self._selected_plans(session),
+            support_seat_picking=bool(task["support_seat_picking"]),
         )
         return required_audience_count(
-            self._task(session)["real_name_mode"], ticket_count
+            task["real_name_mode"], ticket_count
         )
 
     def _selected_plans(self, session: BindingSetupSession):
@@ -366,8 +374,10 @@ class BindingSetupFlow:
         return selected
 
     def _maximum_quantity(self, session: BindingSetupSession) -> int:
-        maximum = int(self._task(session)["session_limitation"]) // purchase_unit_qty(
-            self._selected_plans(session)
+        task = self._task(session)
+        maximum = int(task["session_limitation"]) // purchase_unit_qty(
+            self._selected_plans(session),
+            support_seat_picking=bool(task["support_seat_picking"]),
         )
         if maximum < 1:
             raise ValueError("固定套票张数超过当前场次限购")

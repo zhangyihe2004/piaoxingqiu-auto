@@ -463,7 +463,10 @@ class Database:
                 raise ValueError("目标数量已完成，请重新绑定并设置数量")
             people = self.get_binding_audiences(task_id, account_id)
             plans = self.get_binding_plans(task_id, account_id)
-            ticket_count = int(binding["quantity"]) * purchase_unit_qty(plans)
+            ticket_count = int(binding["quantity"]) * purchase_unit_qty(
+                plans,
+                support_seat_picking=bool(task["support_seat_picking"]),
+            )
             required = required_audience_count(
                 task["real_name_mode"], ticket_count
             )
@@ -585,7 +588,10 @@ class Database:
             if not set(plan_ids) <= known_plans.keys():
                 raise ValueError("票档包含其他场次或已失效的编号")
             selected_plans = [known_plans[plan_id] for plan_id in plan_ids]
-            unit_qty = purchase_unit_qty(selected_plans)
+            unit_qty = purchase_unit_qty(
+                selected_plans,
+                support_seat_picking=bool(task["support_seat_picking"]),
+            )
             maximum = int(task["session_limitation"]) // unit_qty
             if maximum < 1:
                 raise ValueError("固定套票张数超过当前场次限购")
