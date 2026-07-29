@@ -34,7 +34,6 @@ class AuthGuard:
     ) -> None:
         self.site = site
         self.headers = headers if headers is not None else {}
-        self._verified_at = 0.0
         self._validation_suspended = False
         root = f"{site.origin}/cyy_gatewayapi/show"
         self.endpoint = f"{root}/buyer/v5/show/{site.booking_ids[0]}/show_user"
@@ -47,14 +46,21 @@ class AuthGuard:
             if not self.headers:
                 await self._capture()
             return
-        if self.headers and await self.check():
-            return
-        await self.refresh()
-
-    async def refresh(self) -> None:
-        await self._capture()
-        if not await self.check():
-            raise AuthenticationRequired("登录状态无效，请通过飞书重新登录")
+        unknown: Exception | None = None
+        for attempt in range(2):
+            try:
+                if attempt or not self.headers:
+                    await self._capture()
+                if await self.check():
+                    return
+            except AuthenticationRequired:
+                pass
+            except Exception as exc:
+                unknown = exc
+            self.headers.clear()
+        if unknown is not None:
+            raise unknown
+        raise AuthenticationRequired("登录状态无效，请通过飞书重新登录")
 
     async def _capture(self) -> None:
         try:
@@ -64,14 +70,6 @@ class AuthGuard:
         self.headers.clear()
         self.headers.update(headers)
 
-    async def require_recent(self, max_age: float = 5.0) -> None:
-        if self._validation_suspended:
-            return
-        if asyncio.get_running_loop().time() - self._verified_at <= max_age:
-            return
-        if not await self.check():
-            raise AuthenticationRequired("登录状态失效，请通过飞书重新登录")
-
     async def check(self) -> bool:
         if not self.headers:
             return False
@@ -80,7 +78,6 @@ class AuthGuard:
             f"{self.endpoint}?{query}", headers=self.headers
         )
         if response.status in {401, 403}:
-            self._verified_at = 0.0
             return False
         if response.status in {429, 469}:
             raise AuthenticationError(
@@ -92,9 +89,7 @@ class AuthGuard:
         if not isinstance(payload, dict):
             raise AuthenticationError("登录检查响应不是 JSON 对象")
         if str(payload.get("statusCode")) != "200":
-            self._verified_at = 0.0
             return False
-        self._verified_at = asyncio.get_running_loop().time()
         return True
 
     async def audiences(self) -> tuple[OfficialAudience, ...]:

@@ -137,3 +137,22 @@ class PxqClient:
         )
         self._require_list(data, "seatPlans", path)
         return data
+
+    async def seating_static(self, show_id: str, session_id: str) -> dict:
+        """公开座位资源：票档、看台与 Geobuf 地址。"""
+        path = f"/show/pub/v5/show/{show_id}/session/{session_id}/seating/static"
+        return await self._get_object(
+            path,
+            {
+                "lang": "zh",
+                "utcOffset": "480",
+                "terminalSrc": "WEB",
+                "ver": "4.63.3",
+                "currency": "CNY",
+            },
+        )
+
+    async def download(self, url: str) -> bytes:
+        response = await self._http.get(url)
+        response.raise_for_status()
+        return response.content

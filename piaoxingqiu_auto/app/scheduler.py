@@ -27,6 +27,10 @@ from piaoxingqiu_auto.app.database import Database
 from piaoxingqiu_auto.adapters.feishu_gateway import FeishuGateway
 from piaoxingqiu_auto.platform.order_guard import PersistentOrderGuard
 from piaoxingqiu_auto.platform.booking import PurchasePage
+from piaoxingqiu_auto.platform.inventory import (
+    StaticInventoryUnavailable,
+    prewarm_static,
+)
 from piaoxingqiu_auto.domain.outcomes import RunResult
 from piaoxingqiu_auto.runtime.order_flow import check_login, run_account, warm_account
 from piaoxingqiu_auto.domain.sale import (
@@ -50,7 +54,7 @@ log = logging.getLogger("piaoxingqiu.auto")
 ERROR_ALERT_COOLDOWN = 3600.0
 MAX_BACKOFF_FACTOR = 16
 # 状态轮询不应阻塞真正抢票，但也不让大量任务同时打接口。
-MAX_CONCURRENT_POLLS = 6
+MAX_CONCURRENT_POLLS = 4
 NOTICE_RETRY_SECONDS = 10.0
 LOGIN_CHECK_INTERVAL = 15 * 60
 
@@ -183,9 +187,25 @@ class TaskScheduler:
                 previous,
                 sale_phase(task, previous),
             )
-        status, sale_time_ms, snapshot = await self.service.refresh_task(
-            task, sessions_task
+        static_task = (
+            asyncio.create_task(self._prewarm_task_static(task))
+            if self.system.create_order_enabled
+            and task["support_seat_picking"]
+            and task["session_status"] == "PENDING"
+            and (
+                task["sale_time_ms"] is None
+                or task["sale_time_ms"] - int(time.time() * 1000)
+                > PREWARM_SECONDS * 1000
+            )
+            else None
         )
+        try:
+            status, sale_time_ms, snapshot = await self.service.refresh_task(
+                task, sessions_task
+            )
+        finally:
+            if static_task is not None:
+                await static_task
         if not self.db.update_task_snapshot(task_id, status, sale_time_ms, snapshot):
             return
         task = self.db.get_task(task_id)
@@ -243,13 +263,28 @@ class TaskScheduler:
                             account_id,
                             prewarm=prewarm,
                             sale_signal=sale_signal,
-                            prewarm_remaining=remaining,
                         )
                     elif phase in {"AVAILABLE", "RESTOCK"}:
                         self._start_warmup(task_id, account_id)
 
         self._update_stock_notice(task, plans, phase, previous_phase)
         self._schedule_login_checks(task, remaining)
+
+    async def _prewarm_task_static(self, task) -> None:
+        plan_ids = self._task_plan_ids(int(task["id"]))
+        if not plan_ids:
+            return
+        try:
+            await prewarm_static(
+                self.service.client,
+                str(task["show_id"]),
+                str(task["session_id"]),
+                plan_ids,
+            )
+        except StaticInventoryUnavailable:
+            pass
+        except Exception as exc:
+            log.warning("抢票任务 #%s 静态资源预热失败：%s", task["id"], exc)
 
     async def _pause_task(self, task, key: str, reason: str) -> None:
         task_id = int(task["id"])
@@ -439,49 +474,116 @@ class TaskScheduler:
 
     async def _observe_sale(self, task_id: int) -> None:
         failures = 0
-        while True:
-            task = self.db.get_task(task_id)
-            if not task or task["status"] != "active":
-                raise SaleUnavailable("任务已停止")
-            try:
-                sessions, server_time_ms = (
-                    await self.service.client.quick_order_sessions_timed(
-                        str(task["show_id"])
+        loop = asyncio.get_running_loop()
+        task = self.db.get_task(task_id)
+        if not task or task["status"] != "active":
+            raise SaleUnavailable("任务已停止")
+        static_ready = not task["support_seat_picking"]
+        static_task: asyncio.Task[None] | None = None
+        opened_at: float | None = None
+        remaining = PREWARM_SECONDS
+        try:
+            while True:
+                task = self.db.get_task(task_id)
+                if not task or task["status"] != "active":
+                    raise SaleUnavailable("任务已停止")
+                if not static_ready and static_task is None:
+                    plan_ids = self._task_plan_ids(task_id)
+                    if not plan_ids:
+                        raise SaleUnavailable("任务没有已启用账号的票档配置")
+                    static_task = asyncio.create_task(
+                        prewarm_static(
+                            self.service.client,
+                            str(task["show_id"]),
+                            str(task["session_id"]),
+                            plan_ids,
+                        )
                     )
-                )
-                session = find_session(sessions, str(task["session_id"]))
-                if session is None:
-                    raise SaleUnavailable("目标场次已从官方场次列表移除")
-                status = str(session.get("sessionStatus") or "").upper()
-                if status in OPEN_SESSION_STATUSES:
-                    return
-                if status != "PENDING":
-                    raise SaleUnavailable(f"官方场次状态为 {status or 'MISSING'}")
-                sale_time_ms = sale_time(session)
-                if sale_time_ms is None:
-                    raise SaleUnavailable("官方场次未提供开售时间")
-                remaining = (sale_time_ms - server_time_ms) / 1000
-                if remaining > PREWARM_SECONDS:
-                    raise SaleUnavailable("官方开售时间已调整到预热窗口之外")
-                if remaining < -POST_SALE_WAIT_SECONDS:
-                    raise SaleUnavailable("官方未在开售等待窗口内开放")
-                failures = 0
+                if opened_at is None:
+                    try:
+                        sessions, server_time_ms = (
+                            await self.service.client.quick_order_sessions_timed(
+                                str(task["show_id"])
+                            )
+                        )
+                        session = find_session(sessions, str(task["session_id"]))
+                        if session is None:
+                            raise SaleUnavailable("目标场次已从官方场次列表移除")
+                        status = str(session.get("sessionStatus") or "").upper()
+                        if status in OPEN_SESSION_STATUSES:
+                            opened_at = loop.time()
+                        elif status != "PENDING":
+                            raise SaleUnavailable(
+                                f"官方场次状态为 {status or 'MISSING'}"
+                            )
+                        else:
+                            sale_time_ms = sale_time(session)
+                            if sale_time_ms is None:
+                                raise SaleUnavailable("官方场次未提供开售时间")
+                            remaining = (sale_time_ms - server_time_ms) / 1000
+                            if remaining > PREWARM_SECONDS:
+                                raise SaleUnavailable(
+                                    "官方开售时间已调整到预热窗口之外"
+                                )
+                            if remaining < -POST_SALE_WAIT_SECONDS:
+                                raise SaleUnavailable(
+                                    "官方未在开售等待窗口内开放"
+                                )
+                        failures = 0
+                    except (SaleUnavailable, asyncio.CancelledError):
+                        raise
+                    except Exception as exc:
+                        failures += 1
+                        if failures >= 5:
+                            raise SaleUnavailable(
+                                "开售观察连续 5 次请求失败，已交回日常轮询"
+                            ) from exc
+                        log.warning(
+                            "抢票任务 #%s 开售观察请求失败（%s/5），继续等待",
+                            task_id,
+                            failures,
+                            exc_info=True,
+                        )
+                        await asyncio.sleep(1)
+                        continue
+
+                if static_task is not None and (
+                    static_task.done() or opened_at is not None
+                ):
+                    try:
+                        await static_task
+                    except StaticInventoryUnavailable:
+                        pass
+                    except Exception as exc:
+                        log.warning("抢票任务 #%s 静态资源预热失败：%s", task_id, exc)
+                    else:
+                        static_ready = True
+                    static_task = None
+
+                if opened_at is not None:
+                    if static_ready:
+                        return
+                    remaining = -(loop.time() - opened_at)
+                    if remaining < -POST_SALE_WAIT_SECONDS:
+                        raise SaleUnavailable("静态座位资源尚未下发")
+
                 await asyncio.sleep(presale_poll_interval(remaining))
-            except (SaleUnavailable, asyncio.CancelledError):
-                raise
-            except Exception as exc:
-                failures += 1
-                if failures >= 5:
-                    raise SaleUnavailable(
-                        "开售观察连续 5 次请求失败，已交回日常轮询"
-                    ) from exc
-                log.warning(
-                    "抢票任务 #%s 开售观察请求失败（%s/5），继续等待",
-                    task_id,
-                    failures,
-                    exc_info=True,
+        finally:
+            if static_task is not None:
+                static_task.cancel()
+                await asyncio.gather(static_task, return_exceptions=True)
+
+    def _task_plan_ids(self, task_id: int) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                str(plan["seat_plan_id"])
+                for binding in self.db.list_bindings(task_id=task_id)
+                if binding["enabled"]
+                for plan in self.db.get_binding_plans(
+                    task_id, int(binding["account_id"])
                 )
-                await asyncio.sleep(1)
+            )
+        )
 
     def _schedule_next(self, task_id: int) -> None:
         task = self.db.get_task(task_id)
@@ -532,7 +634,6 @@ class TaskScheduler:
         *,
         prewarm: bool,
         sale_signal: asyncio.Task[None] | None = None,
-        prewarm_remaining: float | None = None,
     ) -> None:
         if account_id in self.jobs:
             log.debug("账号 #%s 已有执行任务，忽略重复启动", account_id)
@@ -546,7 +647,6 @@ class TaskScheduler:
                 prewarm,
                 self.checks.get(account_id),
                 sale_signal,
-                prewarm_remaining,
             ),
             name=(
                 f"piaoxingqiu-binding-{task_id}-{account_id}-"
@@ -670,7 +770,6 @@ class TaskScheduler:
         prewarm: bool,
         check: asyncio.Task | None,
         sale_signal: asyncio.Task[None] | None,
-        prewarm_remaining: float | None,
     ) -> str:
         if check:
             log.info("账号 #%s 启动抢票前取消正在进行的登录检查", account_id)
@@ -723,7 +822,6 @@ class TaskScheduler:
                         runtime_cache=self.browsers.account_cache(account_id),
                         execution_gate=self.semaphore if prewarm else None,
                         sale_signal=sale_signal,
-                        prewarm_remaining=prewarm_remaining,
                     )
             except asyncio.CancelledError:
                 current = self.db.get_binding(task_id, account_id)

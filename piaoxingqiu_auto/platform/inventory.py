@@ -5,6 +5,7 @@ import base64
 import math
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlencode
@@ -12,8 +13,7 @@ from urllib.parse import urlencode
 import geobuf
 
 from piaoxingqiu_auto.platform.auth import AuthGuard, request_context
-from piaoxingqiu_auto.platform.api import is_success_payload
-from piaoxingqiu_auto.domain.sale import POST_SALE_WAIT_SECONDS, presale_poll_interval
+from piaoxingqiu_auto.platform.api import BASE_URL, PxqClient, PxqError, is_success_payload
 from piaoxingqiu_auto.domain.seating import (
     Candidate,
     Seat,
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 BATCH_SIZE = 25
 # 单账号库存请求和全局静态资源下载的独立上限。
-DYNAMIC_CONCURRENCY = 6
+DYNAMIC_CONCURRENCY = 4
 DOWNLOAD_CONCURRENCY = 8
 FAST_STOCK_POLL_SECONDS = 0.25
 FAST_STOCK_WINDOW_SECONDS = 5.0
@@ -35,7 +35,6 @@ STOCK_POLL_SECONDS = 1.0
 STOCK_WAIT_SECONDS = 60.0
 STATIC_UNAVAILABLE_CODE = "22024036"
 STATIC_LAYOUT_CACHE_SIZE = 16
-STATIC_RETRY_CACHE_SIZE = 64
 DECODED_RESOURCE_CACHE_SIZE = 64
 SELECTION_QUEUE_SIZE = 10
 T = TypeVar("T")
@@ -57,10 +56,56 @@ class StaticLayout:
 
 _STATIC_LAYOUTS: OrderedDict[str, StaticLayout] = OrderedDict()
 _STATIC_LOADS: dict[str, asyncio.Task[StaticLayout]] = {}
-_STATIC_RETRY_AT: OrderedDict[str, float] = OrderedDict()
+_STATIC_PREWARMS: set[tuple[str, tuple[str, ...]]] = set()
 _DECODED_RESOURCES: OrderedDict[str, tuple[Seat, ...]] = OrderedDict()
 _DECODE_LOADS: dict[str, asyncio.Task[tuple[Seat, ...]]] = {}
 _DOWNLOAD_SEMAPHORE = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
+
+
+async def prewarm_static(
+    client: PxqClient,
+    show_id: str,
+    session_id: str,
+    plan_ids: tuple[str, ...],
+) -> None:
+    """任务级加载 static；元数据就绪后继续预解码相关看台。"""
+    key = (
+        f"{BASE_URL}/show/pub/v5/show/{show_id}/session/{session_id}/seating/static"
+    )
+
+    async def fetch() -> StaticLayout:
+        try:
+            return _static_layout(await client.seating_static(show_id, session_id))
+        except PxqError as exc:
+            if exc.status_code == int(STATIC_UNAVAILABLE_CODE):
+                raise StaticInventoryUnavailable("静态座位资源尚未下发") from exc
+            raise
+
+    layout = await _load_static_layout(key, fetch)
+    preload_key = key, tuple(sorted(plan_ids))
+    if preload_key in _STATIC_PREWARMS:
+        return
+    _STATIC_PREWARMS.add(preload_key)
+    preload = asyncio.create_task(
+        _decode_zones(
+            layout.resources,
+            _configured_zones(layout, plan_ids),
+            client.download,
+        )
+    )
+    preload.add_done_callback(
+        lambda completed: _complete_preload(preload_key, completed)
+    )
+
+
+def _complete_preload(
+    key: tuple[str, tuple[str, ...]],
+    task: asyncio.Task,
+) -> None:
+    with suppress(asyncio.CancelledError):
+        if task.exception() is None:
+            return
+    _STATIC_PREWARMS.discard(key)
 
 
 def _cache_get(cache: OrderedDict[str, T], key: str) -> T | None:
@@ -224,7 +269,10 @@ class InventoryBootstrap:
         )
 
     async def activate(self, *, preload: bool = False) -> Inventory:
-        layout = await _load_static_layout(self.site, self.static_url)
+        layout = await _load_static_layout(
+            self.static_url.partition("?")[0],
+            lambda: _fetch_static_layout(self.site, self.static_url),
+        )
         return await self._inventory(layout, preload)
 
     async def _inventory(
@@ -232,14 +280,13 @@ class InventoryBootstrap:
         layout: StaticLayout,
         preload: bool,
     ) -> Inventory:
-        zone_ids = {
-            zone_id
-            for plan_id in self.plan_ids
-            for zone_id in layout.plan_zones.get(plan_id, ())
-            if zone_id in layout.resources
-        }
+        zone_ids = _configured_zones(layout, self.plan_ids)
         zones = (
-            await _decode_zones(self.site, layout.resources, zone_ids)
+            await _decode_zones(
+                layout.resources,
+                zone_ids,
+                lambda url: _download_resource(self.site, url),
+            )
             if preload and zone_ids
             else {}
         )
@@ -252,58 +299,9 @@ class InventoryBootstrap:
             plan_names=self.plan_names,
             plan_ids=self.plan_ids,
             resources=layout.resources,
+            zone_ids=frozenset(zone_ids),
             zones=zones,
         )
-
-    async def wait_static(
-        self,
-        *,
-        remaining_seconds: float | None = None,
-        preload: bool = False,
-    ) -> Inventory:
-        if remaining_seconds is None:
-            return await _wait_inventory(lambda: self.activate(preload=preload))
-        layout = await _wait_static_layout(
-            self.site,
-            self.static_url,
-            remaining_seconds,
-        )
-        return await self._inventory(layout, preload)
-
-
-async def _wait_static_layout(
-    site: PurchasePage,
-    url: str,
-    remaining_seconds: float,
-) -> StaticLayout:
-    key = url.partition("?")[0]
-    if layout := _cache_get(_STATIC_LAYOUTS, key):
-        return layout
-    loop = asyncio.get_running_loop()
-    sale_at = loop.time() + remaining_seconds
-    deadline = sale_at + POST_SALE_WAIT_SECONDS
-    while True:
-        now = loop.time()
-        if now >= deadline:
-            raise StaticInventoryUnavailable("静态座位资源尚未下发")
-        if (retry_at := _cache_get(_STATIC_RETRY_AT, key) or 0.0) > now:
-            await asyncio.sleep(min(retry_at, deadline) - now)
-            continue
-        try:
-            return await _load_static_layout(site, url)
-        except StaticInventoryUnavailable:
-            remaining = sale_at - loop.time()
-            _cache_put(
-                _STATIC_RETRY_AT,
-                key,
-                loop.time()
-                + min(
-                    presale_poll_interval(remaining),
-                    deadline - loop.time(),
-                ),
-                STATIC_RETRY_CACHE_SIZE,
-            )
-
 
 @dataclass
 class Inventory:
@@ -315,6 +313,7 @@ class Inventory:
     plan_names: tuple[str, ...]
     plan_ids: tuple[str, ...]
     resources: dict[str, str]
+    zone_ids: frozenset[str]
     zones: dict[str, tuple[Seat, ...]]
     selection_queue: tuple[SeatSelection, ...] = ()
     rejected_seat_ids: set[str] = field(default_factory=set)
@@ -322,15 +321,12 @@ class Inventory:
     combo_plans: tuple[dict[str, Any], ...] = ()
     has_activity: bool = False
 
-    @classmethod
-    async def open(cls, site: PurchasePage, auth: AuthGuard) -> Inventory:
-        return await InventoryBootstrap.open(site, auth).activate()
-
     async def refresh(
         self,
         quantity: int,
     ) -> SeatSelection:
-        records, plan_inventory = await asyncio.gather(
+        configured_zones = self.zone_ids - self.zones.keys()
+        records, plan_inventory, decoded = await asyncio.gather(
             _timed(
                 self.site,
                 "dynamic",
@@ -354,7 +350,17 @@ class Inventory:
                     self.plan_ids,
                 ),
             ),
+            _timed(
+                self.site,
+                "seat_decode",
+                _decode_zones(
+                    self.resources,
+                    configured_zones,
+                    lambda url: _download_resource(self.site, url),
+                ),
+            ),
         )
+        self.zones.update(decoded)
         plan_caps = plan_inventory.caps
         self.plan_prices = plan_inventory.prices
         self.combo_plans = plan_inventory.combos
@@ -378,7 +384,13 @@ class Inventory:
         missing = live_zone_ids - self.zones.keys()
         if missing:
             started = asyncio.get_running_loop().time()
-            self.zones.update(await _decode_zones(self.site, self.resources, missing))
+            self.zones.update(
+                await _decode_zones(
+                    self.resources,
+                    missing,
+                    lambda url: _download_resource(self.site, url),
+                )
+            )
             self.site.record_timing(
                 "seat_decode", asyncio.get_running_loop().time() - started
             )
@@ -678,15 +690,14 @@ def _static_data(payload: Any) -> dict[str, Any]:
 
 
 async def _load_static_layout(
-    site: PurchasePage,
-    url: str,
+    key: str,
+    fetch: Callable[[], Awaitable[StaticLayout]],
 ) -> StaticLayout:
-    key = url.partition("?")[0]
     if layout := _cache_get(_STATIC_LAYOUTS, key):
         return layout
     task = _STATIC_LOADS.get(key)
     if task is None:
-        task = asyncio.create_task(_fetch_static_layout(site, url))
+        task = asyncio.create_task(fetch())
         _STATIC_LOADS[key] = task
     try:
         layout = await asyncio.shield(task)
@@ -694,7 +705,6 @@ async def _load_static_layout(
         if task.done() and _STATIC_LOADS.get(key) is task:
             _STATIC_LOADS.pop(key, None)
     _cache_put(_STATIC_LAYOUTS, key, layout, STATIC_LAYOUT_CACHE_SIZE)
-    _STATIC_RETRY_AT.pop(key, None)
     return layout
 
 
@@ -707,7 +717,10 @@ async def _fetch_static_layout(
         raise RuntimeError(f"静态座位接口触发限制（HTTP {response.status}），已停止")
     if not response.ok:
         raise RuntimeError(f"静态座位接口返回 HTTP {response.status}")
-    data = _static_data(await response.json())
+    return _static_layout(_static_data(await response.json()))
+
+
+def _static_layout(data: dict[str, Any]) -> StaticLayout:
     resources = {
         str(item["zoneConcreteId"]): str(item["url"])
         for item in data.get("staticResList", [])
@@ -733,10 +746,22 @@ async def _fetch_static_layout(
     )
 
 
+def _configured_zones(
+    layout: StaticLayout,
+    plan_ids: tuple[str, ...],
+) -> set[str]:
+    return {
+        zone_id
+        for plan_id in plan_ids
+        for zone_id in layout.plan_zones.get(plan_id, ())
+        if zone_id in layout.resources
+    }
+
+
 async def _decode_zones(
-    site: PurchasePage,
     resources: dict[str, str],
-    zone_ids: set[str],
+    zone_ids: set[str] | frozenset[str],
+    download: Callable[[str], Awaitable[bytes]],
 ) -> dict[str, tuple[Seat, ...]]:
     async def decode(zone_id: str) -> tuple[str, tuple[Seat, ...]]:
         url = resources.get(zone_id)
@@ -746,7 +771,7 @@ async def _decode_zones(
         if seats is None:
             task = _DECODE_LOADS.get(url)
             if task is None:
-                task = asyncio.create_task(_decode_resource(site, url, zone_id))
+                task = asyncio.create_task(_decode_resource(download, url, zone_id))
                 _DECODE_LOADS[url] = task
             try:
                 seats = await asyncio.shield(task)
@@ -765,18 +790,23 @@ async def _decode_zones(
 
 
 async def _decode_resource(
-    site: PurchasePage,
+    download: Callable[[str], Awaitable[bytes]],
     url: str,
     zone_id: str,
 ) -> tuple[Seat, ...]:
     async with _DOWNLOAD_SEMAPHORE:
-        response = await site.page.context.request.get(url)
-    if not response.ok:
-        raise RuntimeError(f"看台布局接口返回 HTTP {response.status}")
-    features = geobuf.decode(await response.body()).get("features", [])
+        content = await download(url)
+    features = geobuf.decode(content).get("features", [])
     return _index_rows(
         tuple(filter(None, (_seat(feature, zone_id) for feature in features)))
     )
+
+
+async def _download_resource(site: PurchasePage, url: str) -> bytes:
+    response = await site.page.context.request.get(url)
+    if not response.ok:
+        raise RuntimeError(f"看台布局接口返回 HTTP {response.status}")
+    return await response.body()
 
 
 def _seat(feature: Any, zone_id: str) -> Seat | None:
