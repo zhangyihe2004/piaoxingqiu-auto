@@ -336,8 +336,11 @@ class CartClient:
                 for (const ticket of item.sku.ticketItems) {
                   const base = item.sku.skuType === "COMBO"
                     ? plan.items?.find(
-                        value => (value.bizSeatPlanId || value.seatPlanId)
-                          === ticket.comboItemId
+                        value => [
+                          value.stdSeatPlanId,
+                          value.bizSeatPlanId,
+                          value.seatPlanId
+                        ].includes(ticket.comboItemId)
                       )
                     : plan;
                   if (!base) throw new Error("官方购物模型未找到套票子票档");
@@ -564,22 +567,30 @@ def _seat_preorder(
         for instance in instances:
             ticket_ids = _ticket_ids(len(instance.candidates))
             group_id = _ticket_ids(1)[0]
-            discount = (
-                prices[variant.base_id] * len(instance.candidates) - variant.price
-            )
+            components = variant.components
+            if len(components) != len(instance.candidates):
+                raise RuntimeError("套票组成数量与所选座位数不一致")
+            discount = sum(price for _, price in components) - variant.price
             discounted_tickets.extend(
-                zip(ticket_ids, _split_discount(discount, [1] * len(ticket_ids)))
+                zip(
+                    ticket_ids,
+                    _split_discount(discount, [price for _, price in components]),
+                )
             )
             tickets.extend(
                 {
-                    "comboItemId": candidate.plan_id,
+                    "comboItemId": component_id,
                     "seatConcreteId": candidate.seat.seat_id,
                     "seatGroupId": group_id,
                     "zoneConcreteId": candidate.seat.zone_id,
                     "id": ticket_id,
                     "groupId": "default",
                 }
-                for candidate, ticket_id in zip(instance.candidates, ticket_ids)
+                for candidate, ticket_id, (component_id, _) in zip(
+                    instance.candidates,
+                    ticket_ids,
+                    components,
+                )
             )
         combo_items.append(
             {

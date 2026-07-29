@@ -1,8 +1,7 @@
-"""FREE_COMBO 方案求解；不依赖页面与网络。"""
+"""选座套票分组与 FREE_COMBO 方案求解；不依赖页面与网络。"""
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,9 +14,11 @@ class ComboVariant:
     base_id: str
     quantity: int
     price: float
+    components: tuple[tuple[str, float], ...]
     capacity: int
     display_tag: str
     order: int
+    required: bool = False
 
 
 @dataclass(frozen=True)
@@ -42,7 +43,7 @@ def seat_order_scheme(
     for candidate in selection.candidates:
         grouped.setdefault(candidate.plan_id, []).append(candidate)
     counts = {plan_id: len(items) for plan_id, items in grouped.items() if items}
-    variants = _variants(combo_plans, set(counts))
+    variants = _variants(combo_plans, set(counts), plan_prices)
     by_base: dict[str, tuple[ComboVariant, ...]] = {
         plan_id: tuple(
             sorted(
@@ -52,11 +53,24 @@ def seat_order_scheme(
         )
         for plan_id in counts
     }
-    combo_units = tuple(
-        unit
-        for plan_id, quantity in counts.items()
-        for unit in _best_units(quantity, by_base[plan_id], plan_prices[plan_id])
-    )
+    combo_units = []
+    for plan_id, quantity in counts.items():
+        variant = next(
+            (item for item in by_base[plan_id] if item.required),
+            None,
+        )
+        if variant:
+            units, remainder = divmod(quantity, variant.quantity)
+            if remainder:
+                raise RuntimeError(
+                    f"独立套票 {variant.sku_id} 的座位数必须是 "
+                    f"{variant.quantity} 的倍数"
+                )
+            combo_units.append((variant, units))
+        else:
+            combo_units.extend(
+                _best_units(quantity, by_base[plan_id], plan_prices[plan_id])
+            )
     pools = {
         plan_id: iter(
             sorted(
@@ -85,31 +99,48 @@ def seat_order_scheme(
 def _variants(
     plans: tuple[dict[str, Any], ...],
     wanted: set[str],
+    plan_prices: dict[str, float],
 ) -> tuple[ComboVariant, ...]:
     result = []
     for order, plan in enumerate(plans):
+        category = str(plan.get("seatPlanCategory") or "")
         if (
-            plan.get("seatPlanCategory") != "FREE_COMBO"
+            category not in {"COMBO", "FREE_COMBO"}
             or plan.get("saleStarted") is False
             or plan.get("isStopSale") is True
         ):
             continue
-        components: Counter[str] = Counter()
+        components: list[tuple[str, float]] = []
+        component_bases: set[str] = set()
         for item in plan.get("items", ()):
             if isinstance(item, dict) and item.get("bizSeatPlanId"):
-                components[str(item["bizSeatPlanId"])] += max(
-                    1, int(item.get("unitQty") or 1)
+                base_id = str(item["bizSeatPlanId"])
+                combo_item_id = (
+                    str(item.get("stdSeatPlanId") or base_id)
+                    if category == "COMBO"
+                    else base_id
                 )
-        # 已验证的官方 FREE_COMBO 都在同一基础票档内组合；跨基础票档
-        # 的折扣分摊规则未知，宁可不提交也不猜 create_order。
-        if len(components) != 1:
+                count = max(1, int(item.get("unitQty") or 1))
+                price = float(item.get("originalPrice") or plan_prices.get(base_id, 0))
+                components.extend((combo_item_id, price) for _ in range(count))
+                component_bases.add(base_id)
+        if not components or any(price <= 0 for _, price in components):
             continue
-        base_id, item_quantity = next(iter(components.items()))
+        independent = category == "COMBO" and str(plan.get("seatPlanId") or "") in wanted
+        # FREE_COMBO 目前只采用已验证的同基础票档组合。
+        if independent:
+            base_id = str(plan["seatPlanId"])
+        elif len(component_bases) == 1:
+            base_id = next(iter(component_bases))
+        else:
+            continue
         if base_id not in wanted:
             continue
         price = float(plan.get("originalPrice") or 0)
         capacity = int(plan.get("canBuyCount") or 0)
-        display_tag = str(plan.get("comboDisplayTag") or "")
+        display_tag = str(
+            plan.get("comboDisplayTag") or ("COMBO" if independent else "")
+        )
         if (
             not plan.get("seatPlanId")
             or price <= 0
@@ -121,11 +152,13 @@ def _variants(
             ComboVariant(
                 sku_id=str(plan["seatPlanId"]),
                 base_id=base_id,
-                quantity=item_quantity,
+                quantity=len(components),
                 price=price,
+                components=tuple(components),
                 capacity=capacity,
                 display_tag=display_tag,
                 order=order,
+                required=independent,
             )
         )
     return tuple(result)

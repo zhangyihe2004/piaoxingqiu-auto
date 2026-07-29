@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import math
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
@@ -365,6 +365,11 @@ class Inventory:
         self.plan_prices = plan_inventory.prices
         self.combo_plans = plan_inventory.combos
         self.has_activity = plan_inventory.has_activity
+        plan_units = {
+            str(plan["seatPlanId"]): max(1, int(plan.get("unitQty") or 1))
+            for plan in self.combo_plans
+            if plan.get("seatPlanCategory") == "COMBO"
+        }
         inventories = {
             (rank, plan_name, plan_id): {
                 str(record["zoneConcreteId"]): bits
@@ -432,6 +437,7 @@ class Inventory:
                         candidates,
                         current_quantity,
                         plan_caps,
+                        plan_units,
                         self.selection_queue,
                     )
                 )
@@ -465,6 +471,7 @@ def _selection_queue(
     candidates: tuple[Candidate, ...],
     quantity: int,
     plan_caps: dict[str, int],
+    plan_units: dict[str, int],
     previous: tuple[SeatSelection, ...],
 ) -> tuple[SeatSelection, ...]:
     live = {
@@ -490,8 +497,10 @@ def _selection_queue(
         refreshed_candidates = tuple(
             candidate for candidate in refreshed if candidate is not None
         )
-        if len(refreshed_candidates) == quantity and _within_plan_caps(
-            refreshed_candidates, plan_caps
+        if (
+            len(refreshed_candidates) == quantity
+            and _within_plan_caps(refreshed_candidates, plan_caps)
+            and _valid_plan_units(refreshed_candidates, plan_units)
         ):
             append(_selection(refreshed_candidates))
 
@@ -499,8 +508,10 @@ def _selection_queue(
         candidates,
         quantity,
         plan_caps,
-        limit=SELECTION_QUEUE_SIZE,
+        limit=SELECTION_QUEUE_SIZE * 10,
     ):
+        if not _valid_plan_units(group.candidates, plan_units):
+            continue
         append(_selection(group.candidates))
         if len(queue) == SELECTION_QUEUE_SIZE:
             break
@@ -535,6 +546,14 @@ def _within_plan_caps(
     for candidate in candidates:
         counts[candidate.plan_id] = counts.get(candidate.plan_id, 0) + 1
     return all(count <= plan_caps.get(plan_id, 0) for plan_id, count in counts.items())
+
+
+def _valid_plan_units(
+    candidates: tuple[Candidate, ...],
+    plan_units: dict[str, int],
+) -> bool:
+    counts = Counter(candidate.plan_id for candidate in candidates)
+    return all(count % plan_units.get(plan_id, 1) == 0 for plan_id, count in counts.items())
 
 
 async def _wait_inventory(load: Callable[[], Awaitable[T]]) -> T:
@@ -634,7 +653,13 @@ async def _fetch_plan_inventory(
             for item in base
         },
         combos=tuple(
-            item for item in plans if item.get("seatPlanCategory") == "FREE_COMBO"
+            item
+            for item in plans
+            if item.get("seatPlanCategory") == "FREE_COMBO"
+            or (
+                str(item.get("seatPlanId") or "") in wanted
+                and item.get("seatPlanCategory") == "COMBO"
+            )
         ),
         has_activity=any(item.get("hasActivity") for item in base),
     )
