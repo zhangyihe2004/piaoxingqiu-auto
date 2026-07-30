@@ -169,23 +169,25 @@ class TaskService:
         sessions_task: Awaitable[list[dict]] | None = None,
     ) -> tuple[str, int | None, list[tuple[str, int, bool]] | None]:
         show_id, session_id = task["show_id"], task["session_id"]
-        sessions = await (
-            sessions_task or self.client.quick_order_sessions(show_id)
-        )
-        session = next(
-            (
-                item
-                for item in sessions
-                if item.get("bizShowSessionId") == session_id
-            ),
-            None,
-        )
-        if session is None:
-            raise SessionUnavailable("目标场次已从公开接口移除")
-        session_status = str(
-            session.get("sessionStatus") or MISSING_SESSION_STATUS
-        ).upper()
-        sale_time_ms = sale_time(session)
+        if sessions_task is not None:
+            sessions = await sessions_task
+            session = next(
+                (
+                    item
+                    for item in sessions
+                    if item.get("bizShowSessionId") == session_id
+                ),
+                None,
+            )
+            if session is None:
+                raise SessionUnavailable("目标场次已从公开接口移除")
+            session_status = str(
+                session.get("sessionStatus") or MISSING_SESSION_STATUS
+            ).upper()
+            sale_time_ms = sale_time(session)
+        else:
+            session_status = str(task["session_status"]).upper()
+            sale_time_ms = task["sale_time_ms"]
         snapshot = None
         if session_status in OPEN_SESSION_STATUSES:
             plans = await self.client.quick_order_plans(show_id, session_id)

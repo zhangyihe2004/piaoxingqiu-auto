@@ -126,13 +126,21 @@ class TaskScheduler:
 
             async def poll_due(task) -> None:
                 async with semaphore:
-                    show_id = str(task["show_id"])
-                    sessions_task = session_tasks.get(show_id)
-                    if sessions_task is None:
-                        sessions_task = asyncio.create_task(
-                            self.service.client.quick_order_sessions(show_id)
-                        )
-                        session_tasks[show_id] = sessions_task
+                    task_id = int(task["id"])
+                    sessions_task = None
+                    opened_from_prewarm = (
+                        self.phases.get(task_id) == "PREWARM"
+                        and str(task["session_status"]).upper()
+                        in OPEN_SESSION_STATUSES
+                    )
+                    if not opened_from_prewarm:
+                        show_id = str(task["show_id"])
+                        sessions_task = session_tasks.get(show_id)
+                        if sessions_task is None:
+                            sessions_task = asyncio.create_task(
+                                self.service.client.quick_order_sessions(show_id)
+                            )
+                            session_tasks[show_id] = sessions_task
                     await self._poll_safely(task, sessions_task)
 
             await asyncio.gather(*(poll_due(task) for task in due))
@@ -141,7 +149,7 @@ class TaskScheduler:
     async def _poll_safely(
         self,
         task,
-        sessions_task: asyncio.Task[list[dict]],
+        sessions_task: asyncio.Task[list[dict]] | None,
     ) -> None:
         task_id = int(task["id"])
         try:
@@ -177,7 +185,7 @@ class TaskScheduler:
     async def _poll(
         self,
         task,
-        sessions_task: asyncio.Task[list[dict]],
+        sessions_task: asyncio.Task[list[dict]] | None,
     ) -> None:
         task_id = int(task["id"])
         if task_id not in self.available_plans:
@@ -452,11 +460,6 @@ class TaskScheduler:
         def finish(completed: asyncio.Task[None]) -> None:
             if self.sale_watchers.get(task_id) is completed:
                 self.sale_watchers.pop(task_id, None)
-            task = self.db.get_task(task_id)
-            if task and task["status"] == "active":
-                self.next_poll[task_id] = 0
-            else:
-                self.next_poll.pop(task_id, None)
             try:
                 completed.result()
             except asyncio.CancelledError:
@@ -467,6 +470,11 @@ class TaskScheduler:
                 log.exception("抢票任务 #%s 开售观察异常", task_id)
             else:
                 log.info("抢票任务 #%s 官方已开放，释放全部预热账号", task_id)
+            task = self.db.get_task(task_id)
+            if task and task["status"] == "active":
+                self.next_poll[task_id] = 0
+            else:
+                self.next_poll.pop(task_id, None)
 
         watcher.add_done_callback(finish)
         return watcher
@@ -479,6 +487,7 @@ class TaskScheduler:
             raise SaleUnavailable("任务已停止")
         static_ready = not task["support_seat_picking"]
         static_task: asyncio.Task[None] | None = None
+        observed_open: tuple[str, int | None] | None = None
         opened_at: float | None = None
         remaining = PREWARM_SECONDS
         try:
@@ -510,6 +519,7 @@ class TaskScheduler:
                             raise SaleUnavailable("目标场次已从官方场次列表移除")
                         status = str(session.get("sessionStatus") or "").upper()
                         if status in OPEN_SESSION_STATUSES:
+                            observed_open = (status, sale_time(session))
                             opened_at = loop.time()
                         elif status != "PENDING":
                             raise SaleUnavailable(
@@ -561,6 +571,11 @@ class TaskScheduler:
 
                 if opened_at is not None:
                     if static_ready:
+                        assert observed_open is not None
+                        if not self.db.update_task_snapshot(
+                            task_id, *observed_open, None
+                        ):
+                            raise SaleUnavailable("任务已停止")
                         return
                     remaining = -(loop.time() - opened_at)
                     if remaining < -POST_SALE_WAIT_SECONDS:
