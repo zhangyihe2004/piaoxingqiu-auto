@@ -749,8 +749,11 @@ class TaskScheduler:
         ):
             return
         plans = self.db.get_binding_plans(task_id, account_id)
+        stands = self.db.get_binding_stands(task_id, account_id)
         people = self.db.get_binding_audiences(task_id, account_id)
-        config = build_order_config(task, plans, people, account, binding, self.system)
+        config = build_order_config(
+            task, plans, stands, people, account, binding, self.system
+        )
         try:
             async with self.browsers.use(account_id, config.browser) as context:
                 warm = await self.browsers.task_page(account_id, task_id, context)
@@ -817,9 +820,10 @@ class TaskScheduler:
                     prewarm = False
                 elif phase != "PREWARM":
                     return f"预热阶段已结束（{phase}）"
+            stands = self.db.get_binding_stands(task_id, account_id)
             people = self.db.get_binding_audiences(task_id, account_id)
             config = build_order_config(
-                task, plans, people, account, binding, self.system
+                task, plans, stands, people, account, binding, self.system
             )
             if not self.db.claim_binding(task_id, account_id):
                 return "绑定状态竞争失败"

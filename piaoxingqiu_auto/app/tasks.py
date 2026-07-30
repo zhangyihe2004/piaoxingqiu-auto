@@ -6,7 +6,11 @@ import asyncio
 from collections.abc import Awaitable
 from typing import Any
 
-from piaoxingqiu_auto.platform.api import PxqClient
+from piaoxingqiu_auto.platform.api import PxqClient, PxqError
+from piaoxingqiu_auto.platform.inventory import (
+    StaticInventoryUnavailable,
+    available_stand_names,
+)
 from piaoxingqiu_auto.app.database import Database
 from piaoxingqiu_auto.domain.sale import (
     MIN_INTERVAL,
@@ -129,6 +133,25 @@ class TaskService:
 
     async def plans(self, show_id: str, session_id: str) -> list[dict]:
         return logical_plans(await self.client.quick_order_plans(show_id, session_id))
+
+    async def stands(
+        self, task_id: int, plan_ids: list[str]
+    ) -> list[str]:
+        task = self.db.get_task(task_id)
+        if not task or not task["support_seat_picking"]:
+            return []
+        try:
+            data = await self.client.seating_static(
+                task["show_id"], task["session_id"]
+            )
+        except PxqError as exc:
+            if exc.status_code == 22024036:
+                return []
+            raise
+        try:
+            return available_stand_names(data, tuple(plan_ids))
+        except StaticInventoryUnavailable:
+            return []
 
     def create_task(
         self,

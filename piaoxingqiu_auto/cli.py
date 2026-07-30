@@ -166,6 +166,7 @@ def _recover_bindings(db: Database, system) -> None:
                     config = build_order_config(
                         task,
                         db.get_binding_plans(task["id"], account["id"]),
+                        db.get_binding_stands(task["id"], account["id"]),
                         db.get_binding_audiences(task["id"], account["id"]),
                         account,
                         binding,

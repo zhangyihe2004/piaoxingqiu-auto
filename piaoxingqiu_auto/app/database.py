@@ -95,6 +95,15 @@ CREATE TABLE IF NOT EXISTS binding_plans (
     FOREIGN KEY(task_id, account_id)
         REFERENCES bindings(task_id, account_id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS binding_stands (
+    task_id INTEGER NOT NULL,
+    account_id INTEGER NOT NULL,
+    stand_name TEXT NOT NULL,
+    PRIMARY KEY(task_id, account_id, stand_name),
+    FOREIGN KEY(task_id, account_id)
+        REFERENCES bindings(task_id, account_id) ON DELETE CASCADE
+);
 """
 
 
@@ -563,12 +572,15 @@ class Database:
         task_id: int,
         account_id: int,
         plan_ids: list[str],
+        stands: list[str],
         quantity: int,
         people: list[tuple[str, str]],
     ) -> None:
         """校验并以一个事务同时替换票档、观演人和运行状态。"""
         if not plan_ids or len(plan_ids) != len(set(plan_ids)):
             raise ValueError("至少选择一个不重复的票档")
+        if len(stands) != len(set(stands)):
+            raise ValueError("指定看台不能重复")
         masked_ids = [masked_id for _, masked_id in people]
         if len(masked_ids) != len(set(masked_ids)):
             raise ValueError("同一证件不能重复添加")
@@ -587,6 +599,8 @@ class Database:
             }
             if not set(plan_ids) <= known_plans.keys():
                 raise ValueError("票档包含其他场次或已失效的编号")
+            if stands and not task["support_seat_picking"]:
+                raise ValueError("不选座场次不能指定看台")
             selected_plans = [known_plans[plan_id] for plan_id in plan_ids]
             unit_qty = purchase_unit_qty(
                 selected_plans,
@@ -656,6 +670,21 @@ class Database:
                 ],
             )
             self.connection.execute(
+                "DELETE FROM binding_stands WHERE task_id = ? AND account_id = ?",
+                (task_id, account_id),
+            )
+            self.connection.executemany(
+                """
+                INSERT INTO binding_stands (
+                    task_id, account_id, stand_name
+                ) VALUES (?, ?, ?)
+                """,
+                [
+                    (task_id, account_id, stand_name)
+                    for stand_name in stands
+                ],
+            )
+            self.connection.execute(
                 "DELETE FROM binding_audiences WHERE task_id = ? AND account_id = ?",
                 (task_id, account_id),
             )
@@ -721,6 +750,18 @@ class Database:
              AND p.seat_plan_id = bp.seat_plan_id
             WHERE bp.task_id = ? AND bp.account_id = ?
             ORDER BY bp.priority
+            """,
+            (task_id, account_id),
+        ).fetchall()
+
+    def get_binding_stands(
+        self, task_id: int, account_id: int
+    ) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            """
+            SELECT * FROM binding_stands
+            WHERE task_id = ? AND account_id = ?
+            ORDER BY stand_name
             """,
             (task_id, account_id),
         ).fetchall()

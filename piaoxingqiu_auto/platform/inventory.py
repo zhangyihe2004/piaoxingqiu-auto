@@ -52,6 +52,7 @@ class StaticInventoryUnavailable(RuntimeError):
 class StaticLayout:
     resources: dict[str, str]
     plan_zones: dict[str, frozenset[str]]
+    zone_names: dict[str, str]
 
 
 _STATIC_LAYOUTS: OrderedDict[str, StaticLayout] = OrderedDict()
@@ -281,6 +282,18 @@ class InventoryBootstrap:
         preload: bool,
     ) -> Inventory:
         zone_ids = _configured_zones(layout, self.plan_ids)
+        if self.site.config.purchase.stand_names:
+            wanted = set(self.site.config.purchase.stand_names)
+            available = {
+                layout.zone_names.get(zone_id)
+                for zone_id in zone_ids
+            }
+            if wanted <= available:
+                zone_ids = {
+                    zone_id
+                    for zone_id in zone_ids
+                    if layout.zone_names.get(zone_id) in wanted
+                }
         zones = (
             await _decode_zones(
                 layout.resources,
@@ -757,17 +770,29 @@ def _static_layout(data: dict[str, Any]) -> StaticLayout:
     if not resources:
         raise StaticInventoryUnavailable("静态座位资源尚未下发")
     plan_zones: dict[str, set[str]] = {}
+    zone_names: dict[str, str] = {}
     for item in data.get("planZoneList", []):
         if not isinstance(item, dict) or not item.get("seatPlanId"):
             continue
-        plan_zones.setdefault(str(item["seatPlanId"]), set()).update(
-            str(zone["zoneConcreteId"])
+        zones = [
+            zone
             for zone in item.get("zoneConcretes", [])
             if isinstance(zone, dict) and zone.get("zoneConcreteId")
+        ]
+        plan_zones.setdefault(str(item["seatPlanId"]), set()).update(
+            str(zone["zoneConcreteId"]) for zone in zones
+        )
+        zone_names.update(
+            {
+                str(zone["zoneConcreteId"]): str(zone.get("zoneName") or "").strip()
+                for zone in zones
+                if zone.get("zoneName")
+            }
         )
     return StaticLayout(
         resources,
         {plan_id: frozenset(zones) for plan_id, zones in plan_zones.items()},
+        zone_names,
     )
 
 
@@ -781,6 +806,20 @@ def _configured_zones(
         for zone_id in layout.plan_zones.get(plan_id, ())
         if zone_id in layout.resources
     }
+
+
+def available_stand_names(
+    data: dict[str, Any],
+    plan_ids: tuple[str, ...],
+) -> list[str]:
+    layout = _static_layout(data)
+    return sorted(
+        {
+            layout.zone_names[zone_id]
+            for zone_id in _configured_zones(layout, plan_ids)
+            if zone_id in layout.zone_names
+        }
+    )
 
 
 async def _decode_zones(

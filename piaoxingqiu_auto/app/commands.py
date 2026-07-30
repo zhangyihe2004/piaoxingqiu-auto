@@ -80,6 +80,7 @@ class CommandWorker:
             db,
             scheduler.cancel_binding,
             scheduler.official_audiences,
+            service.stands,
             self._clear_order_state,
             self._reply,
         )
@@ -336,6 +337,7 @@ class CommandWorker:
             if not account:
                 continue
             account_plans = self.db.get_binding_plans(task_id, account["id"])
+            stands = self.db.get_binding_stands(task_id, account["id"])
             people = self.db.get_binding_audiences(task_id, account["id"])
             lines.extend(
                 (
@@ -347,6 +349,21 @@ class CommandWorker:
                         if account_plans
                         else "未配置"
                     ),
+                )
+            )
+            if task["support_seat_picking"]:
+                lines.append(
+                    "看台："
+                    + (
+                        "、".join(
+                            stand["stand_name"] for stand in stands
+                        )
+                        if stands
+                        else "不限"
+                    )
+                )
+            lines.extend(
+                (
                     f"{quantity_name}：{binding['quantity']} {quantity_unit}",
                     (
                         "观演人：无需配置"

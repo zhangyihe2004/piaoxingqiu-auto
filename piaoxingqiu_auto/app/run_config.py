@@ -14,7 +14,7 @@ from piaoxingqiu_auto.domain.models import (
 
 
 def build_order_config(
-    task, plans, audiences, account, binding, system: SystemConfig
+    task, plans, stands, audiences, account, binding, system: SystemConfig
 ) -> AccountRunConfig:
     if not plans:
         raise RuntimeError("绑定尚未配置票档")
@@ -36,6 +36,7 @@ def build_order_config(
             task["session_name"],
             tuple(plan["plan_name"] for plan in plans),
             tuple(plan["seat_plan_id"] for plan in plans),
+            tuple(stand["stand_name"] for stand in stands),
             quantity,
             task["real_name_mode"],
             people,
@@ -49,7 +50,7 @@ def build_login_config(task, account, system: SystemConfig) -> AccountRunConfig:
     return AccountRunConfig(
         project=_project_config(task),
         purchase=PurchaseConfig(
-            task["session_name"], (), (), 0, task["real_name_mode"], ()
+            task["session_name"], (), (), (), 0, task["real_name_mode"], ()
         ),
         browser=build_browser_config(account, system),
         create_order=False,

@@ -30,10 +30,12 @@ class BindingSetupSession:
     task_id: int
     account_id: int
     plan_ids: list[str]
+    stands: list[str]
     quantity: int
     people: list[tuple[str, str]]
     last_message_id: str
     phase: str = "PLANS"
+    stand_options: tuple[str, ...] = field(default_factory=tuple)
     official_people: tuple[OfficialAudience, ...] = field(default_factory=tuple)
     touched_at: float = 0.0
 
@@ -52,12 +54,14 @@ class BindingSetupFlow:
         load_audiences: Callable[
             [int, int], Awaitable[tuple[OfficialAudience, ...]]
         ],
+        load_stands: Callable[[int, list[str]], Awaitable[list[str]]],
         clear_order_state: Callable[[int, int], None],
         reply: Callable[[str, str], Awaitable[None]],
     ) -> None:
         self.db = db
         self.cancel_binding = cancel_binding
         self.load_audiences = load_audiences
+        self.load_stands = load_stands
         self.clear_order_state = clear_order_state
         self.reply = reply
         self.sessions: dict[str, BindingSetupSession] = {}
@@ -95,6 +99,10 @@ class BindingSetupFlow:
                 row["seat_plan_id"]
                 for row in self.db.get_binding_plans(task_id, account_id)
             ],
+            stands=[
+                row["stand_name"]
+                for row in self.db.get_binding_stands(task_id, account_id)
+            ],
             quantity=int(binding["quantity"]) if binding else 1,
             people=[
                 (row["name"], row["masked_id"])
@@ -124,7 +132,9 @@ class BindingSetupFlow:
             self._drop(session)
             return "绑定配置已取消；原配置不变，绑定不会自动启动。"
         if session.phase == "PLANS":
-            return self._consume_plans(session, text)
+            return await self._consume_plans(session, text)
+        if session.phase == "STANDS":
+            return self._consume_stands(session, text)
         if session.phase == "QUANTITY":
             return await self._consume_quantity(session, text)
         if session.phase == "PEOPLE":
@@ -151,8 +161,11 @@ class BindingSetupFlow:
     def is_configuring(self, task_id: int, account_id: int) -> bool:
         return (task_id, account_id) in self.binding_owners
 
-    def _consume_plans(self, session: BindingSetupSession, text: str) -> str:
+    async def _consume_plans(
+        self, session: BindingSetupSession, text: str
+    ) -> str:
         plans = self._task_plans(session)
+        previous = tuple(session.plan_ids)
         if text == "保留":
             if not session.plan_ids:
                 return self._plans_prompt(session, "当前没有已选票档。")
@@ -162,10 +175,60 @@ class BindingSetupFlow:
             except ValueError as exc:
                 return self._plans_prompt(session, str(exc))
             session.plan_ids = [plans[number - 1]["seat_plan_id"] for number in numbers]
+        if tuple(session.plan_ids) != previous:
+            session.stands.clear()
         try:
             self._maximum_quantity(session)
         except ValueError as exc:
             return self._plans_prompt(session, str(exc))
+        if not self._task(session)["support_seat_picking"]:
+            session.stands.clear()
+            session.phase = "QUANTITY"
+            return self._quantity_prompt(session)
+        try:
+            session.stand_options = tuple(
+                await self.load_stands(session.task_id, session.plan_ids)
+            )
+        except Exception as exc:
+            return self._plans_prompt(session, f"读取看台失败：{exc}")
+        if session.stand_options:
+            valid_names = set(session.stand_options)
+            session.stands = [
+                name for name in session.stands if name in valid_names
+            ]
+        session.phase = "STANDS"
+        return self._stands_prompt(session)
+
+    def _consume_stands(
+        self, session: BindingSetupSession, text: str
+    ) -> str:
+        if text == "不限":
+            session.stands.clear()
+        elif text == "保留":
+            if not session.stands:
+                return self._stands_prompt(session, "当前没有已选看台。")
+        elif session.stand_options:
+            try:
+                numbers = set(
+                    parse_numbers(text, len(session.stand_options), "看台")
+                )
+            except ValueError as exc:
+                return self._stands_prompt(session, str(exc))
+            session.stands = [
+                option
+                for number, option in enumerate(session.stand_options, 1)
+                if number in numbers
+            ]
+        else:
+            session.stands = list(
+                dict.fromkeys(
+                    name.strip()
+                    for name in text.replace("，", ",").split(",")
+                    if name.strip()
+                )
+            )
+            if not session.stands:
+                return self._stands_prompt(session, "至少输入一个看台名。")
         session.phase = "QUANTITY"
         return self._quantity_prompt(session)
 
@@ -234,6 +297,7 @@ class BindingSetupFlow:
                 session.task_id,
                 session.account_id,
                 session.plan_ids,
+                session.stands,
                 session.quantity,
                 session.people,
             )
@@ -254,7 +318,7 @@ class BindingSetupFlow:
         plans = self._task_plans(session)
         selected = {plan_id: index for index, plan_id in enumerate(session.plan_ids, 1)}
         lines = [
-            f"绑定任务 #{session.task_id}｜账号 #{session.account_id}（1/3）",
+            f"绑定任务 #{session.task_id}｜账号 #{session.account_id}",
             "选择票档",
         ]
         if notice:
@@ -272,6 +336,37 @@ class BindingSetupFlow:
         lines.append("退出：取消")
         return "\n".join(lines)
 
+    def _stands_prompt(
+        self, session: BindingSetupSession, notice: str = ""
+    ) -> str:
+        selected = set(session.stands)
+        lines = [
+            f"绑定任务 #{session.task_id}｜账号 #{session.account_id}",
+            "指定看台",
+        ]
+        if notice:
+            lines.extend(("", notice))
+        if session.stand_options:
+            for number, option in enumerate(session.stand_options, 1):
+                lines.append(
+                    f"{number}. {option}"
+                    f"{'｜✓' if option in selected else ''}"
+                )
+            instruction = "发送：1,3"
+        else:
+            lines.extend(
+                (
+                    "",
+                    "官方尚未下发可选看台列表；名称将在开售后精确验证。",
+                )
+            )
+            instruction = "发送官方看台名：A1区,A2区"
+        lines.extend(("", instruction, "不限看台：不限"))
+        if session.stands:
+            lines.append("保留原选择：保留")
+        lines.append("退出：取消")
+        return "\n".join(lines)
+
     def _quantity_prompt(
         self, session: BindingSetupSession, notice: str = ""
     ) -> str:
@@ -279,7 +374,7 @@ class BindingSetupFlow:
         maximum = self._maximum_quantity(session)
         label, unit = quantity_label(bool(task["support_seat_picking"]))
         lines = [
-            f"绑定任务 #{session.task_id}｜账号 #{session.account_id}（2/3）",
+            f"绑定任务 #{session.task_id}｜账号 #{session.account_id}",
             f"设置{label}",
         ]
         if notice:
@@ -300,7 +395,7 @@ class BindingSetupFlow:
     ) -> str:
         required = self._required_people(session)
         lines = [
-            f"绑定任务 #{session.task_id}｜账号 #{session.account_id}（3/3）",
+            f"绑定任务 #{session.task_id}｜账号 #{session.account_id}",
             f"选择官方观演人（需要 {required} 位）",
         ]
         if notice:
@@ -334,6 +429,11 @@ class BindingSetupFlow:
             f"{label}：{session.quantity} {unit}",
             f"实名：{real_name_label(task['real_name_mode'])}",
         ]
+        if task["support_seat_picking"]:
+            lines.insert(
+                1,
+                f"看台：{'、'.join(session.stands) if session.stands else '不限'}",
+            )
         if session.people:
             lines.append(f"观演人（{len(session.people)}）：")
             lines.extend(
