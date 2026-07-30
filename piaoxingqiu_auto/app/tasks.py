@@ -136,7 +136,7 @@ class TaskService:
 
     async def stands(
         self, task_id: int, plan_ids: list[str]
-    ) -> list[str]:
+    ) -> list[str] | None:
         task = self.db.get_task(task_id)
         if not task or not task["support_seat_picking"]:
             return []
@@ -144,14 +144,13 @@ class TaskService:
             data = await self.client.seating_static(
                 task["show_id"], task["session_id"]
             )
+            return available_stand_names(data, tuple(plan_ids))
         except PxqError as exc:
             if exc.status_code == 22024036:
-                return []
+                return None
             raise
-        try:
-            return available_stand_names(data, tuple(plan_ids))
         except StaticInventoryUnavailable:
-            return []
+            return None
 
     def create_task(
         self,

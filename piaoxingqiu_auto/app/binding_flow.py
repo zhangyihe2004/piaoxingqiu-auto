@@ -54,7 +54,7 @@ class BindingSetupFlow:
         load_audiences: Callable[
             [int, int], Awaitable[tuple[OfficialAudience, ...]]
         ],
-        load_stands: Callable[[int, list[str]], Awaitable[list[str]]],
+        load_stands: Callable[[int, list[str]], Awaitable[list[str] | None]],
         clear_order_state: Callable[[int, int], None],
         reply: Callable[[str, str], Awaitable[None]],
     ) -> None:
@@ -186,11 +186,14 @@ class BindingSetupFlow:
             session.phase = "QUANTITY"
             return self._quantity_prompt(session)
         try:
-            session.stand_options = tuple(
-                await self.load_stands(session.task_id, session.plan_ids)
-            )
+            stands = await self.load_stands(session.task_id, session.plan_ids)
         except Exception as exc:
             return self._plans_prompt(session, f"读取看台失败：{exc}")
+        if stands is not None and not stands:
+            session.stands.clear()
+            session.phase = "QUANTITY"
+            return self._quantity_prompt(session)
+        session.stand_options = tuple(stands or ())
         if session.stand_options:
             valid_names = set(session.stand_options)
             session.stands = [
@@ -330,7 +333,7 @@ class BindingSetupFlow:
                 f"{'｜支持套票优惠' if plan['has_combo'] else ''}"
                 f"{f'｜✓ {priority}' if priority else ''}"
             )
-        lines.extend(("", "发送：1,3,2（顺序即优先级）"))
+        lines.extend(("", "发送：1,3,2"))
         if session.plan_ids:
             lines.append("保留原选择：保留")
         lines.append("退出：取消")

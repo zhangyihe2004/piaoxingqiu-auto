@@ -284,10 +284,7 @@ class InventoryBootstrap:
         zone_ids = _configured_zones(layout, self.plan_ids)
         if self.site.config.purchase.stand_names:
             wanted = set(self.site.config.purchase.stand_names)
-            available = {
-                layout.zone_names.get(zone_id)
-                for zone_id in zone_ids
-            }
+            available = {layout.zone_names.get(zone_id) for zone_id in zone_ids}
             if wanted <= available:
                 zone_ids = {
                     zone_id
@@ -348,7 +345,7 @@ class Inventory:
                     self.endpoint,
                     self.common,
                     self.headers,
-                    tuple(self.resources),
+                    tuple(self.zone_ids),
                     self.plan_ids,
                 ),
             ),
@@ -387,7 +384,9 @@ class Inventory:
             (rank, plan_name, plan_id): {
                 str(record["zoneConcreteId"]): bits
                 for record in records
-                if (bits := _plan_bits(record, plan_id)) and any(bits)
+                if str(record.get("zoneConcreteId") or "") in self.zone_ids
+                and (bits := _plan_bits(record, plan_id))
+                and any(bits)
             }
             for rank, (plan_name, plan_id) in enumerate(
                 zip(self.plan_names, self.plan_ids)
