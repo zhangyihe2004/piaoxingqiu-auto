@@ -56,6 +56,7 @@ async def run_account(
     runtime_cache: dict[str, object] | None = None,
     execution_gate: asyncio.Semaphore | None = None,
     sale_signal: Awaitable[None] | None = None,
+    seat_available: Callable[[], None] | None = None,
 ) -> RunResult:
     """执行一个账号的一次自动抢票生命周期，最多创建一个订单。"""
     if not config.create_order:
@@ -88,6 +89,7 @@ async def run_account(
             runtime_cache=runtime_cache,
             acquire_execution=acquire_execution,
             sale_signal=sale_signal,
+            seat_available=seat_available,
         )
     finally:
         if slot_acquired:
@@ -127,6 +129,7 @@ async def _run_account(
     runtime_cache: dict[str, object] | None,
     acquire_execution: Callable[[], Awaitable[None]],
     sale_signal: Awaitable[None] | None,
+    seat_available: Callable[[], None] | None,
 ) -> RunResult:
     timings = RunTimings(trace_label or config.project.name)
     site = PurchasePage(page, config, timings.record)
@@ -162,6 +165,8 @@ async def _run_account(
                 acquire_execution,
                 sale_signal,
             )
+            if seat_available is not None:
+                seat_available()
             selection, prepared = await _prepare_seats(
                 cart,
                 seat_source,

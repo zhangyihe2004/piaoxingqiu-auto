@@ -97,6 +97,7 @@ class TaskScheduler:
         self.pending_notices: dict[int, dict[str, PendingNotice]] = {}
         self.next_notice_retry = 0.0
         self.available_plans: dict[int, set[str]] = {}
+        self.stand_stock: set[tuple[int, int]] = set()
         self.phases: dict[int, str] = {}
 
     async def run_forever(self) -> None:
@@ -254,15 +255,17 @@ class TaskScheduler:
                 account = self.db.get_account(binding["account_id"])
                 if not account or account["status"] != "READY":
                     continue
+                account_id = int(binding["account_id"])
                 account_plans = self.db.get_binding_plans(
-                    task_id, binding["account_id"]
+                    task_id, account_id
                 )
                 available = any(
                     plan["sale_started"] and plan["can_buy_count"] > 0
                     for plan in account_plans
                 )
+                if not available:
+                    self._clear_stand_stock(task_id, account_id)
                 if binding["enabled"] and binding["status"] == "READY":
-                    account_id = int(binding["account_id"])
                     if prewarm or (phase == "AVAILABLE" and available):
                         if prewarm and sale_signal is None:
                             sale_signal = self._ensure_sale_watcher(task)
@@ -371,6 +374,7 @@ class TaskScheduler:
             str(plan["seat_plan_id"])
             for binding in self.db.list_bindings(task_id=task_id)
             if binding["enabled"]
+            and not self.db.get_binding_stands(task_id, binding["account_id"])
             for plan in self.db.get_binding_plans(task_id, binding["account_id"])
         }
         return {
@@ -411,6 +415,38 @@ class TaskScheduler:
         if notice.key in pending:
             return
         pending[notice.key] = notice
+
+    def _notify_stand_stock(
+        self,
+        task_id: int,
+        account_id: int,
+        task,
+        plans,
+        stands,
+    ) -> None:
+        key = (task_id, account_id)
+        if key in self.stand_stock:
+            return
+        self.stand_stock.add(key)
+        self._send_notice(
+            task_id,
+            PendingNotice(
+                f"stand-stock:{account_id}",
+                "余票提醒",
+                (
+                    f"任务 #{task_id}｜账号 #{account_id}\n"
+                    f"**{task['show_name']}**\n"
+                    f"场次：{task['session_name']}\n"
+                    f"票档：{' → '.join(plan['plan_name'] for plan in plans)}\n"
+                    f"看台：{'、'.join(stand['stand_name'] for stand in stands)}"
+                ),
+                "red",
+            ),
+        )
+
+    def _clear_stand_stock(self, task_id: int, account_id: int) -> None:
+        self.stand_stock.discard((task_id, account_id))
+        self.pending_notices.get(task_id, {}).pop(f"stand-stock:{account_id}", None)
 
     async def _retry_notices(self) -> None:
         if not self.pending_notices or time.monotonic() < self.next_notice_retry:
@@ -840,6 +876,13 @@ class TaskScheduler:
                         runtime_cache=self.browsers.account_cache(account_id),
                         execution_gate=self.semaphore if prewarm else None,
                         sale_signal=sale_signal,
+                        seat_available=(
+                            lambda: self._notify_stand_stock(
+                                task_id, account_id, task, plans, stands
+                            )
+                            if stands
+                            else None
+                        ),
                     )
             except asyncio.CancelledError:
                 current = self.db.get_binding(task_id, account_id)
@@ -926,6 +969,10 @@ class TaskScheduler:
                 self.db.set_account_status(
                     account_id, "NEEDS_LOGIN", error=result.message
                 )
+            if result.status == "RESTOCK":
+                self._clear_stand_stock(task_id, account_id)
+            elif result.status != "FAILED":
+                self.stand_stock.discard((task_id, account_id))
             if result.status != "RESTOCK":
                 self._notify_result(task_id, account_id, task, result)
             if result.status == "STOP_BINDING":
@@ -1041,6 +1088,7 @@ class TaskScheduler:
         *,
         reason: str = "账号操作",
     ) -> None:
+        self._clear_stand_stock(task_id, account_id)
         pending = self.pending_notices.get(task_id)
         if pending:
             for key in tuple(pending):
@@ -1078,6 +1126,9 @@ class TaskScheduler:
         self, account_id: int, *, reason: str = "账号操作"
     ) -> None:
         self.next_auth.pop(account_id, None)
+        for task_id, current_account_id in tuple(self.stand_stock):
+            if current_account_id == account_id:
+                self._clear_stand_stock(task_id, account_id)
         for pending in self.pending_notices.values():
             for key in tuple(pending):
                 if key == f"login:{account_id}" or key.startswith(
