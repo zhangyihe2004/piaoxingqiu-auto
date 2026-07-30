@@ -34,7 +34,7 @@ HELP = """票星球自动抢票
 
 【创建】
 搜索 <关键词>
-抢票 <搜索序号> [场次序号]
+抢票 <搜索序号>
 
 【查看】
 列表
@@ -85,6 +85,9 @@ class CommandWorker:
             self._reply,
         )
         self.searches: dict[tuple[str, str], tuple[float, list[dict]]] = {}
+        self.session_choices: dict[
+            tuple[str, str], tuple[dict, str, list[dict]]
+        ] = {}
 
     async def run_forever(self) -> None:
         maintenance = asyncio.create_task(self._maintain())
@@ -122,6 +125,11 @@ class CommandWorker:
             self.searches = {
                 key: value for key, value in self.searches.items() if value[0] > cutoff
             }
+            self.session_choices = {
+                key: value
+                for key, value in self.session_choices.items()
+                if key in self.searches
+            }
             await self._retry_replies()
 
     async def _retry_replies(self) -> None:
@@ -134,6 +142,9 @@ class CommandWorker:
         if response is not None:
             return response
         response = await self.configurator.consume(command)
+        if response is not None:
+            return response
+        response = await self._consume_session_choice(command)
         if response is not None:
             return response
         try:
@@ -213,30 +224,55 @@ class CommandWorker:
         return None
 
     async def _create(self, command: IncomingCommand, parts: list[str]) -> str:
-        if len(parts) not in {2, 3}:
-            return "发送：抢票 <搜索序号> [场次序号]"
+        if len(parts) != 2:
+            return "发送：抢票 <搜索序号>"
         show = self._search_show(command, parts[1])
         if not show:
             return "搜索序号无效或结果已过期，请重新搜索。"
-        if len(parts) == 3 and not parts[2].isdigit():
-            return "场次序号必须是数字。"
         show_id = str(show.get("showId") or "")
         show_name, sessions = await self.service.show_sessions(show_id)
         if not sessions:
             return "该演出当前没有场次。"
-        if len(sessions) > 1 and len(parts) == 2:
+        if len(sessions) > 1:
+            self.session_choices[self._key(command)] = (
+                show,
+                show_name,
+                sessions,
+            )
             lines = [f"演出：{show_name}", f"场次（{len(sessions)}）："]
             lines.extend(
                 f"{number}. {session.get('sessionName', '')}"
                 for number, session in enumerate(sessions, 1)
             )
-            lines.extend(("", f"发送：抢票 {parts[1]} <场次序号>"))
+            lines.extend(("", "发送：<场次序号>", "退出：取消"))
             return "\n".join(lines)
-        session_number = int(parts[2]) if len(parts) == 3 else 1
-        if not 1 <= session_number <= len(sessions):
-            return f"场次编号必须在 1~{len(sessions)} 之间。"
+        return await self._create_task(show, show_name, sessions[0])
+
+    async def _consume_session_choice(
+        self, command: IncomingCommand
+    ) -> str | None:
+        key = self._key(command)
+        pending = self.session_choices.get(key)
+        if pending is None:
+            return None
+        text = command.text.strip()
+        if text == "取消":
+            self.session_choices.pop(key, None)
+            return "已取消创建任务。"
+        show, show_name, sessions = pending
+        if not text.isdigit() or not 1 <= int(text) <= len(sessions):
+            return f"请发送 1~{len(sessions)} 的场次序号；退出：取消"
+        self.session_choices.pop(key, None)
+        return await self._create_task(show, show_name, sessions[int(text) - 1])
+
+    async def _create_task(
+        self,
+        show: dict,
+        show_name: str,
+        session: dict,
+    ) -> str:
+        show_id = str(show.get("showId") or "")
         interval = 60
-        session = sessions[session_number - 1]
         plans = await self.service.plans(show_id, session["bizShowSessionId"])
         task_id, created = self.service.create_task(
             show_id=show_id,

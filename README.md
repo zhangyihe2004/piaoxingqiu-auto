@@ -103,7 +103,7 @@ WantedBy=multi-user.target
 
 ```text
 搜索 <关键词>
-抢票 <搜索序号> [场次序号]
+抢票 <搜索序号>
 列表
 详情 <任务ID>
 暂停 <任务ID>
