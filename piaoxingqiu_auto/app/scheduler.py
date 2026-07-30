@@ -59,6 +59,27 @@ NOTICE_RETRY_SECONDS = 10.0
 LOGIN_CHECK_INTERVAL = 15 * 60
 
 
+def _stock_notice_body(task, plans, account_id: int | None = None) -> str:
+    def detail(number, plan) -> str:
+        count = int(plan["can_buy_count"])
+        stock = f"{count} 张" if count else "无票"
+        return f"{number}. {plan['plan_name']}｜{stock if plan['sale_started'] else '未开售'}"
+
+    task_label = f"任务 #{task['id']}" + (
+        f"｜账号 #{account_id}" if account_id is not None else ""
+    )
+    return "\n".join(
+        (
+            task_label,
+            f"**{task['show_name']}**",
+            f"场次：{task['session_name']}",
+            "",
+            f"票档明细（{len(plans)}）：",
+            *(detail(number, plan) for number, plan in enumerate(plans, 1)),
+        )
+    )
+
+
 @dataclass(frozen=True)
 class PendingNotice:
     key: str
@@ -347,23 +368,12 @@ class TaskScheduler:
         if not added:
             self.available_plans[task_id] = current
             return
-        available = [plan for plan in plans if str(plan["seat_plan_id"]) in added]
         self._send_notice(
             task_id,
             PendingNotice(
                 "stock",
                 "余票提醒",
-                "\n".join(
-                    (
-                        f"任务 #{task_id}\n**{task['show_name']}**",
-                        f"场次：{task['session_name']}",
-                        *(
-                            f"· {plan['plan_name']}：最多可买 "
-                            f"{plan['can_buy_count']} 张"
-                            for plan in available
-                        ),
-                    )
-                ),
+                _stock_notice_body(task, plans),
                 "red",
                 available_after=frozenset(current),
             ),
@@ -418,12 +428,10 @@ class TaskScheduler:
 
     def _notify_stand_stock(
         self,
-        task_id: int,
         account_id: int,
         task,
-        plans,
-        stands,
     ) -> None:
+        task_id = int(task["id"])
         key = (task_id, account_id)
         if key in self.stand_stock:
             return
@@ -433,12 +441,10 @@ class TaskScheduler:
             PendingNotice(
                 f"stand-stock:{account_id}",
                 "余票提醒",
-                (
-                    f"任务 #{task_id}｜账号 #{account_id}\n"
-                    f"**{task['show_name']}**\n"
-                    f"场次：{task['session_name']}\n"
-                    f"票档：{' → '.join(plan['plan_name'] for plan in plans)}\n"
-                    f"看台：{'、'.join(stand['stand_name'] for stand in stands)}"
+                _stock_notice_body(
+                    task,
+                    self.db.get_task_plans(task_id),
+                    account_id,
                 ),
                 "red",
             ),
@@ -877,10 +883,12 @@ class TaskScheduler:
                         execution_gate=self.semaphore if prewarm else None,
                         sale_signal=sale_signal,
                         seat_available=(
-                            lambda: self._notify_stand_stock(
-                                task_id, account_id, task, plans, stands
+                            (
+                                lambda: self._notify_stand_stock(
+                                    account_id, task
+                                )
                             )
-                            if stands
+                            if stands and not prewarm
                             else None
                         ),
                     )
