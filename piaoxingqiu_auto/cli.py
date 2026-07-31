@@ -64,6 +64,7 @@ async def _serve() -> None:
     from piaoxingqiu_auto.app.scheduler import TaskScheduler
     from piaoxingqiu_auto.app.tasks import TaskService
     from piaoxingqiu_auto.platform.api import PxqClient
+    from piaoxingqiu_auto.runtime.operator import OperatorGateway
 
     logging.basicConfig(
         level=logging.INFO,
@@ -76,7 +77,9 @@ async def _serve() -> None:
     queue: asyncio.Queue[IncomingCommand] = asyncio.Queue(maxsize=100)
     feishu = FeishuGateway(system.raw, queue)
     service = TaskService(db, client)
-    scheduler = TaskScheduler(db, service, feishu, system)
+    operator = OperatorGateway()
+    await operator.start()
+    scheduler = TaskScheduler(db, service, feishu, system, operator)
     login = FeishuLoginManager(db, feishu, system, scheduler.cancel_account)
     worker = CommandWorker(queue, db, service, scheduler, login, feishu)
     tasks = [
@@ -96,6 +99,7 @@ async def _serve() -> None:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await scheduler.close()
+        await operator.close()
         await login.close()
         await feishu.aclose()
         await client.aclose()
@@ -142,7 +146,7 @@ def _doctor() -> None:
 
 def _recover_bindings(db: Database, system) -> None:
     from piaoxingqiu_auto.app.run_config import build_login_config, build_order_config
-    from piaoxingqiu_auto.platform.order_guard import PersistentOrderGuard
+    from piaoxingqiu_auto.platform.submission import PersistentOrderGuard
 
     for binding in db.list_bindings():
         account = db.get_account(binding["account_id"])

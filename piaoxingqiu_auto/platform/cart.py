@@ -21,6 +21,15 @@ from piaoxingqiu_auto.domain.models import (
 from piaoxingqiu_auto.domain.seating import Candidate, SeatSelection
 from piaoxingqiu_auto.platform.auth import AuthGuard
 from piaoxingqiu_auto.platform.inventory import GeneralAdmissionSelection, Inventory
+from piaoxingqiu_auto.platform.submission import (
+    LIMITING_INTERVAL_SECONDS,
+    LIMITING_MODE,
+    MAX_LIMITING_RETRIES,
+    QUEUE_CODE,
+    RiskEvent,
+    RiskNotice,
+    VERIFY_CODE,
+)
 
 
 PRE_ORDER_PATH = "/cyy_gatewayapi/trade/buyer/order/cart/v1/pre_order"
@@ -36,11 +45,20 @@ class CartRejected(RuntimeError):
         code: str | None,
         sub_code: str | None,
         message: str,
+        *,
+        mode: str | None = None,
+        rc_code: str | None = None,
+        rc_id: str | None = None,
+        rc_show_id: str | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.sub_code = sub_code
         self.message = message
+        self.mode = mode
+        self.rc_code = rc_code
+        self.rc_id = rc_id
+        self.rc_show_id = rc_show_id
 
 
 @dataclass(frozen=True)
@@ -77,10 +95,12 @@ class CartClient:
         site,
         auth: AuthGuard,
         cache: dict[str, Any] | None = None,
+        risk_notice: RiskNotice | None = None,
     ) -> None:
         self.site = site
         self.auth = auth
         self.cache = cache if cache is not None else {}
+        self.risk_notice = risk_notice
 
     async def warm(self, audiences: tuple[AudienceConfig, ...]) -> None:
         await self.site.prepare_booking()
@@ -108,6 +128,7 @@ class CartClient:
             show_id,
             session_id,
             self._version,
+            self._source,
         )
         return await self._prepare(
             pre_request,
@@ -131,6 +152,7 @@ class CartClient:
             show_id,
             session_id,
             self._version,
+            self._source,
         )
         return await self._prepare(
             pre_request,
@@ -149,6 +171,13 @@ class CartClient:
     @property
     def _version(self) -> str:
         return self.auth.headers.get("ver", "4.63.6")
+
+    @property
+    def _source(self) -> str:
+        source = self.auth.headers.get("src") or self.auth.headers.get("terminal-src")
+        if not source:
+            raise RuntimeError("认证请求缺少平台标识")
+        return source.upper()
 
     async def _prepare(
         self,
@@ -170,7 +199,7 @@ class CartClient:
                 f"订单需要 {required} 个实名证件，当前仅配置 {len(selected)} 个"
             )
         pre_started = asyncio.get_running_loop().time()
-        pre_task = asyncio.create_task(self._request(PRE_ORDER_PATH, pre_request))
+        pre_task = asyncio.create_task(self._preorder(pre_request))
         location_task = asyncio.create_task(self._location_id())
         audience_task = (
             asyncio.create_task(self._audience_ids(selected)) if selected else None
@@ -234,6 +263,36 @@ class CartClient:
                 ),
             ),
         )
+
+    async def _preorder(self, payload: dict) -> dict:
+        verification_retried = False
+        for attempt in range(MAX_LIMITING_RETRIES + 1):
+            try:
+                return await self._request(PRE_ORDER_PATH, payload)
+            except CartRejected as exc:
+                risk = _risk_event(exc)
+                if risk is not None and risk.state == "VERIFY_REQUIRED":
+                    if verification_retried or self.risk_notice is None:
+                        raise
+                    notice = self.risk_notice(risk)
+                    if notice is None:
+                        raise
+                    verification_retried = True
+                    try:
+                        await notice
+                    except TimeoutError:
+                        raise exc from None
+                    continue
+                if risk is not None and self.risk_notice is not None:
+                    self.risk_notice(risk)
+                if (
+                    risk is None
+                    or risk.state != "RATE_LIMITED"
+                    or attempt == MAX_LIMITING_RETRIES
+                ):
+                    raise
+                await asyncio.sleep(LIMITING_INTERVAL_SECONDS)
+        raise AssertionError("unreachable")
 
     async def _audience_ids(self, configured: tuple[AudienceConfig, ...]) -> list[str]:
         official = self.cache.get("audiences")
@@ -446,7 +505,10 @@ class CartClient:
                   method,
                   ...(method === "POST" ? { data: payload } : {})
                 });
-                return { body: response?.data?.statusCode ? response.data : response };
+                return {
+                  body: response?.data?.statusCode ? response.data : response,
+                  headers: response?.header || response?.headers || {}
+                };
               } catch (error) {
                 if (tolerateError) return { body: null };
                 throw error;
@@ -461,6 +523,7 @@ class CartClient:
             },
         )
         body = result.get("body") if isinstance(result, dict) else None
+        headers = result.get("headers") if isinstance(result, dict) else None
         if tolerate_error:
             return body or {}
         if (
@@ -471,7 +534,12 @@ class CartClient:
             raise CartRejected(
                 _scalar(body, "statusCode", "code", "errorCode"),
                 _scalar(body, "subCode", "sub_code", "bizCode"),
-                str((body or {}).get("comments") or "响应格式错误"),
+                _scalar(body, "comments", "message", "msg", "desc")
+                or "响应格式错误",
+                mode=_scalar(body, "mode"),
+                rc_code=_header(headers, "rc-code"),
+                rc_id=_header(headers, "rc-id"),
+                rc_show_id=_header(headers, "rc-show-id"),
             )
         return body
 
@@ -484,6 +552,30 @@ def _scalar(value: object, *keys: str) -> str | None:
         if isinstance(item, (str, int, float)):
             return str(item)
     return None
+
+
+def _header(value: object, name: str) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    target = name.lower()
+    for key, item in value.items():
+        if str(key).lower() == target and isinstance(item, (str, int, float)):
+            return str(item)
+    return None
+
+
+def _risk_event(error: CartRejected) -> RiskEvent | None:
+    state = {
+        QUEUE_CODE: "QUEUEING",
+        VERIFY_CODE: "VERIFY_REQUIRED",
+    }.get(error.rc_code)
+    if state is None and (error.mode or "").lower() == LIMITING_MODE:
+        state = "RATE_LIMITED"
+    return (
+        RiskEvent(state, "PRE_ORDER", error.rc_id, error.rc_show_id)
+        if state is not None
+        else None
+    )
 
 
 def _ticket_ids(count: int) -> list[str]:
@@ -500,10 +592,10 @@ def _ticket_ids(count: int) -> list[str]:
     return values
 
 
-def _base_request(items: list[dict], ver: str) -> dict:
+def _base_request(items: list[dict], ver: str, source: str) -> dict:
     return {
         "clientCurrency": "CNY",
-        "couponQueryParam": {"src": "H5", "onlySearchCanUse": False},
+        "couponQueryParam": {"src": source, "onlySearchCanUse": False},
         "orderSource": "COMMON",
         "orders": [
             {
@@ -515,7 +607,7 @@ def _base_request(items: list[dict], ver: str) -> dict:
             }
         ],
         "scene": "NORMAL",
-        "src": "H5",
+        "src": source,
         "ver": ver,
     }
 
@@ -526,6 +618,7 @@ def _seat_preorder(
     show_id: str,
     session_id: str,
     ver: str,
+    source: str,
 ) -> tuple[dict, tuple[_ComboPriceGroup, ...], str | None]:
     grouped: OrderedDict[str, list[Candidate]] = OrderedDict()
     for candidate in scheme.singles:
@@ -610,7 +703,7 @@ def _seat_preorder(
         if any(item.variant.display_tag == "COMBO" for item in scheme.combos)
         else "DISCOUNT" if scheme.combos else None
     )
-    return _base_request(combo_items + single_items, ver), price_groups, combo_tag
+    return _base_request(combo_items + single_items, ver, source), price_groups, combo_tag
 
 
 def _general_preorder(
@@ -618,6 +711,7 @@ def _general_preorder(
     show_id: str,
     session_id: str,
     ver: str,
+    source: str,
 ) -> tuple[dict, tuple[_ComboPriceGroup, ...], str | None]:
     ticket_ids = iter(_ticket_ids(selection.ticket_count))
     tickets = []
@@ -664,6 +758,7 @@ def _general_preorder(
             "spu": {"sessionId": session_id, "showId": show_id},
         }],
         ver,
+        source,
     )
     return request, groups, "COMBO" if groups else None
 

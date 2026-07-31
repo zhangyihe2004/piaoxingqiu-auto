@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 
@@ -18,6 +19,7 @@ from piaoxingqiu_auto.runtime.browser import (
     MAX_WARM_PAGES_PER_ACCOUNT,
     AccountBrowserPool,
 )
+from piaoxingqiu_auto.runtime.operator import OperatorGateway
 from piaoxingqiu_auto.app.run_config import build_login_config, build_order_config
 from piaoxingqiu_auto.domain.models import (
     AccountRunConfig,
@@ -25,7 +27,7 @@ from piaoxingqiu_auto.domain.models import (
 )
 from piaoxingqiu_auto.app.database import Database
 from piaoxingqiu_auto.adapters.feishu_gateway import FeishuGateway
-from piaoxingqiu_auto.platform.order_guard import PersistentOrderGuard
+from piaoxingqiu_auto.platform.submission import PersistentOrderGuard, RiskEvent
 from piaoxingqiu_auto.platform.booking import PurchasePage
 from piaoxingqiu_auto.platform.inventory import (
     StaticInventoryUnavailable,
@@ -98,11 +100,13 @@ class TaskScheduler:
         service: TaskService,
         feishu: FeishuGateway,
         system: SystemConfig,
+        operator: OperatorGateway,
     ) -> None:
         self.db = db
         self.service = service
         self.feishu = feishu
         self.system = system
+        self.operator = operator
         self.semaphore = asyncio.Semaphore(system.max_concurrent_accounts)
         self.login_semaphore = asyncio.Semaphore(min(system.max_concurrent_accounts, 4))
         self.jobs: dict[int, asyncio.Task] = {}
@@ -891,6 +895,14 @@ class TaskScheduler:
                             if stands and not prewarm
                             else None
                         ),
+                        risk_notice=(
+                            lambda event: self._notify_risk(
+                                account_id,
+                                task,
+                                warm.page,
+                                event,
+                            )
+                        ),
                     )
             except asyncio.CancelledError:
                 current = self.db.get_binding(task_id, account_id)
@@ -938,6 +950,8 @@ class TaskScheduler:
                         )
                 self._notify_result(task_id, account_id, task, result)
                 return result.status
+            finally:
+                self.operator.revoke(task_id, account_id)
             if not result.reuse_page:
                 with suppress(Exception):
                     await self.browsers.close_task_page(account_id, task_id)
@@ -1087,6 +1101,61 @@ class TaskScheduler:
                 body,
                 color,
             ),
+        )
+
+    def _notify_risk(
+        self,
+        account_id: int,
+        task,
+        page,
+        event: RiskEvent,
+    ) -> Awaitable[None] | None:
+        task_id = int(task["id"])
+        if event.state == "RATE_LIMITED":
+            log.info(
+                "任务 #%s 账号 #%s %s 被官方限流，保持原请求重试",
+                task_id,
+                account_id,
+                event.stage,
+            )
+            return None
+        queueing = event.state == "QUEUEING"
+        title = "官方排队中" if queueing else "需要人工验证"
+        access = (
+            self.operator.issue(task_id, account_id, page)
+            if not queueing
+            else None
+        )
+        message = (
+            "当前订单正在票星球官方队列中。程序将保留原页面和请求，"
+            "等待官方结果；请勿停止服务或重复启动任务。"
+            if queueing
+            else (
+                "票星球要求完成官方人机验证。程序已保留原页面和请求。\n"
+                + (
+                    f"人工验证入口：{access.url}\n链接有效期：5分钟。"
+                    if access is not None
+                    else "当前尚未配置远程人工验证入口。"
+                )
+            )
+        )
+        self._send_notice(
+            task_id,
+            PendingNotice(
+                f"risk:{account_id}:{event.stage}:{event.state}:{event.rc_id or ''}",
+                title,
+                (
+                    f"任务 #{task_id}｜账号 #{account_id}\n"
+                    f"**{task['show_name']}**\n"
+                    f"阶段：{event.stage}\n{message}"
+                ),
+                "orange",
+            ),
+        )
+        return (
+            access.wait()
+            if access is not None and event.stage == "PRE_ORDER"
+            else None
         )
 
     async def cancel_binding(

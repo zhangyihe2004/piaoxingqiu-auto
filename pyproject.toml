@@ -9,6 +9,7 @@ description = "票星球监控、飞书控制与 Playwright 自动创建订单"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "aiohttp>=3.10,<4",
     "geobuf>=2.0.1,<3",
     "httpx>=0.27,<1",
     "lark-oapi==1.7.1",

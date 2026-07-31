@@ -13,7 +13,7 @@ from piaoxingqiu_auto.app.database import Database
 from piaoxingqiu_auto.app.scheduler import TaskScheduler
 from piaoxingqiu_auto.adapters.feishu_gateway import FeishuGateway, IncomingCommand
 from piaoxingqiu_auto.app.login_flow import FeishuLoginManager
-from piaoxingqiu_auto.platform.order_guard import PersistentOrderGuard
+from piaoxingqiu_auto.platform.submission import PersistentOrderGuard
 from piaoxingqiu_auto.domain.sale import MIN_INTERVAL, sale_phase
 from piaoxingqiu_auto.app.tasks import TaskService, quantity_label, real_name_label
 

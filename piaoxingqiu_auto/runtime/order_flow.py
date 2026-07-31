@@ -26,10 +26,11 @@ from piaoxingqiu_auto.platform.inventory import (
     InventoryUnavailable,
     StaticInventoryUnavailable,
 )
-from piaoxingqiu_auto.platform.order_guard import OrderFirewall, PersistentOrderGuard
-from piaoxingqiu_auto.platform.order_response import (
-    CreateResponseWatcher,
+from piaoxingqiu_auto.platform.submission import (
     CreateResult,
+    PersistentOrderGuard,
+    RiskNotice,
+    SubmissionSession,
     create_failure_action,
     find_already_purchased_ids,
     match_configured_ids,
@@ -39,9 +40,8 @@ from piaoxingqiu_auto.runtime.timing import RunTimings
 
 
 log = logging.getLogger("piaoxingqiu.auto")
-MAX_CREATE_ATTEMPTS = 5
+MAX_BUSINESS_ATTEMPTS = 5
 MAX_PREORDER_ATTEMPTS = 3
-CREATE_ROUTE = "**/trade/buyer/order/cart/v1/create_order*"
 T = TypeVar("T")
 
 
@@ -57,17 +57,16 @@ async def run_account(
     execution_gate: asyncio.Semaphore | None = None,
     sale_signal: Awaitable[None] | None = None,
     seat_available: Callable[[], None] | None = None,
+    risk_notice: RiskNotice | None = None,
 ) -> RunResult:
     """执行一个账号的一次自动抢票生命周期，最多创建一个订单。"""
     if not config.create_order:
         return RunResult("DISABLED", "全局 create_order_enabled 尚未开启")
     page = page or await blank_page(context)
-    firewall = OrderFirewall()
-    watcher = CreateResponseWatcher()
-    route_handler = firewall.route
-    response_handler = watcher.handle
-    await page.route(CREATE_ROUTE, route_handler)
-    page.on("response", response_handler)
+    guard = PersistentOrderGuard(config.state_path, config.plan_key)
+    guard.require_ready()
+    submission = SubmissionSession(page, guard)
+    await submission.attach()
     slot_acquired = False
 
     async def acquire_execution() -> None:
@@ -81,8 +80,7 @@ async def run_account(
         return await _run_account(
             config,
             page,
-            firewall,
-            watcher,
+            submission,
             prewarm=prewarm,
             trace_label=trace_label,
             auth_headers=auth_headers,
@@ -90,14 +88,12 @@ async def run_account(
             acquire_execution=acquire_execution,
             sale_signal=sale_signal,
             seat_available=seat_available,
+            risk_notice=risk_notice,
         )
     finally:
         if slot_acquired:
             execution_gate.release()
-        with suppress(Exception):
-            page.remove_listener("response", response_handler)
-        with suppress(Exception):
-            await page.unroute(CREATE_ROUTE, route_handler)
+        await submission.detach()
 
 
 async def warm_account(
@@ -120,8 +116,7 @@ async def warm_account(
 async def _run_account(
     config: AccountRunConfig,
     page: Page,
-    firewall: OrderFirewall,
-    watcher: CreateResponseWatcher,
+    submission: SubmissionSession,
     *,
     prewarm: bool,
     trace_label: str | None,
@@ -130,11 +125,10 @@ async def _run_account(
     acquire_execution: Callable[[], Awaitable[None]],
     sale_signal: Awaitable[None] | None,
     seat_available: Callable[[], None] | None,
+    risk_notice: RiskNotice | None,
 ) -> RunResult:
     timings = RunTimings(trace_label or config.project.name)
     site = PurchasePage(page, config, timings.record)
-    guard = PersistentOrderGuard(config.state_path, config.plan_key)
-    guard.require_ready()
     auth = AuthGuard(site, auth_headers)
     if not prewarm and auth.headers:
         auth.suspend_validation()
@@ -144,7 +138,7 @@ async def _run_account(
         return RunResult("NEEDS_LOGIN", "登录状态已失效")
     auth.suspend_validation()
 
-    cart = CartClient(site, auth, runtime_cache)
+    cart = CartClient(site, auth, runtime_cache, risk_notice)
     seat_source: Inventory | None = None
     general_source: GeneralAdmissionInventory | None = None
     people = config.purchase.audiences
@@ -233,32 +227,37 @@ async def _run_account(
         timings.finish(f"PRE_ORDER_{result.code or 'FAILED'}")
         return RunResult(
             "STOP_BINDING" if action == "STOP_BINDING" else "FAILED",
-            f"预下单被明确拒绝：{_create_diagnostic(result)}",
+            _preorder_diagnostic(result),
+            reuse_page=result.risk_state is not None,
         )
     except Exception:
         timings.finish("PREPARE_FAILED")
         await _save_failure(site, config, "prepare-failed")
         raise
 
-    if firewall.blocked_requests:
+    if submission.blocked_requests:
         timings.finish("UNEXPECTED_CREATE")
         raise RuntimeError("准备阶段出现意外创建请求，已拦截并停止")
 
     attempt = 0
+    create_requests = 0
     rebuilt = False
     while True:
         attempt += 1
 
         try:
-            result = await _create_once(
-                cart,
-                prepared,
-                firewall,
-                watcher,
-                guard,
-                timings,
+            started = asyncio.get_running_loop().time()
+            outcome = await submission.submit(
+                prepared.payload,
+                lambda: cart.create(prepared.payload),
                 config.browser.timeout_ms / 1000,
+                risk_notice,
             )
+            timings.record(
+                "create_total", asyncio.get_running_loop().time() - started
+            )
+            result = outcome.result
+            create_requests += outcome.request_count
         except TimeoutError:
             return RunResult(
                 "UNKNOWN",
@@ -276,14 +275,13 @@ async def _run_account(
 
         timings.finish(result.code or ("SUCCESS" if result.success else "NO_CODE"))
         if result.success:
-            guard.created(result.order_id)
             used_ids = tuple(person.masked_id for person in selected_people)
             removed.extend(item for item in used_ids if item not in removed)
             fulfilled_quantity += selected_order_quantity
             return _created_result(
                 result,
                 prepared,
-                attempt,
+                create_requests,
                 removed,
                 fulfilled_quantity,
                 config.purchase.quantity,
@@ -293,7 +291,7 @@ async def _run_account(
         diagnostic = _create_diagnostic(result)
         log.info("创建请求第 %s 次失败：%s", attempt, diagnostic)
         if action == "UNKNOWN":
-            guard.unknown()
+            submission.guard.unknown()
             await _save_failure(site, config, "create-failed")
             return RunResult(
                 "UNKNOWN",
@@ -302,7 +300,6 @@ async def _run_account(
                 fulfilled_quantity=fulfilled_quantity,
             )
 
-        guard.ready()
         if action == "STOP_BINDING":
             return RunResult(
                 "STOP_BINDING",
@@ -365,11 +362,11 @@ async def _run_account(
                 )
             recovery = "RESELECT"
 
-        if attempt >= MAX_CREATE_ATTEMPTS:
+        if attempt >= MAX_BUSINESS_ATTEMPTS:
             await _save_failure(site, config, "create-failed")
             return RunResult(
                 "FAILED",
-                f"连续 {MAX_CREATE_ATTEMPTS} 次创建请求被明确拒绝；"
+                f"连续 {MAX_BUSINESS_ATTEMPTS} 次创建请求被明确拒绝；"
                 f"最后一次：{diagnostic}",
                 removed_audiences=tuple(removed),
                 fulfilled_quantity=fulfilled_quantity,
@@ -417,9 +414,10 @@ async def _run_account(
             timings.finish(f"RECOVER_PRE_ORDER_{rejected.code or 'FAILED'}")
             return RunResult(
                 "STOP_BINDING" if action == "STOP_BINDING" else "FAILED",
-                f"冲突恢复时预下单被拒绝：{_create_diagnostic(rejected)}",
+                _preorder_diagnostic(rejected, recovery=True),
                 removed_audiences=tuple(removed),
                 fulfilled_quantity=fulfilled_quantity,
+                reuse_page=rejected.risk_state is not None,
             )
         except AuthenticationRequired:
             timings.finish("RECOVER_NEEDS_LOGIN")
@@ -530,9 +528,12 @@ async def _prepare_cart(
         try:
             return selection, await prepare(selection)
         except CartRejected as exc:
+            result = _rejected_result(exc)
             if attempt + 1 == MAX_PREORDER_ATTEMPTS:
                 raise
-            action = create_failure_action(_rejected_result(exc))
+            if result.risk_state is not None:
+                raise
+            action = create_failure_action(result)
             if action == "RESELECT":
                 if reject is not None:
                     reject(selection)
@@ -550,53 +551,16 @@ async def _wait_sale(signal: Awaitable[None] | None) -> None:
     await asyncio.shield(signal)
 
 
-async def _create_once(
-    cart: CartClient,
-    prepared: CartOrder,
-    firewall: OrderFirewall,
-    watcher: CreateResponseWatcher,
-    guard: PersistentOrderGuard,
-    timings: RunTimings,
-    timeout: float,
-) -> CreateResult | None:
-    firewall.arm_once()
-    guard.submitting()
-    started = asyncio.get_running_loop().time()
-    try:
-        await cart.create(prepared.payload)
-    except Exception:
-        if not firewall.attempt_allowed:
-            firewall.disarm()
-            guard.ready()
-            raise
-    if not firewall.attempt_allowed:
-        firewall.disarm()
-        guard.ready()
-        timings.record("create_total", asyncio.get_running_loop().time() - started)
-        return None
-    try:
-        result = await watcher.wait(timeout)
-    except TimeoutError:
-        guard.unknown()
-        timings.record("create_total", asyncio.get_running_loop().time() - started)
-        timings.finish("TIMEOUT")
-        raise
-    finally:
-        firewall.disarm()
-    timings.record("create_total", asyncio.get_running_loop().time() - started)
-    return result
-
-
 def _created_result(
     result: CreateResult,
     prepared: CartOrder,
-    attempt: int,
+    request_count: int,
     removed: list[str],
     fulfilled: int,
     target: int,
 ) -> RunResult:
     details = [
-        f"订单已创建（尝试 {attempt} 次）；{prepared.summary.describe()}；"
+        f"订单已创建（创建请求 {request_count} 次）；{prepared.summary.describe()}；"
         f"使用 {len(prepared.audiences)} 个证件"
     ]
     details.append(
@@ -673,15 +637,37 @@ def _create_diagnostic(result: CreateResult) -> str:
     )
 
 
+def _preorder_diagnostic(
+    result: CreateResult,
+    *,
+    recovery: bool = False,
+) -> str:
+    prefix = "冲突恢复时预下单" if recovery else "预下单"
+    state = {
+        "QUEUEING": "进入官方排队",
+        "VERIFY_REQUIRED": "需要在保留页面中完成人机验证",
+        "RATE_LIMITED": "连续三次被官方限流",
+    }.get(result.risk_state)
+    return (
+        f"{prefix}{state}：{_create_diagnostic(result)}"
+        if state
+        else f"{prefix}被明确拒绝：{_create_diagnostic(result)}"
+    )
+
+
 def _rejected_result(error: CartRejected) -> CreateResult:
     return CreateResult(
-        False,
-        None,
-        None,
-        None,
-        0,
-        200,
-        error.code,
-        error.sub_code,
-        error.message,
+        success=False,
+        order_id=None,
+        order_number=None,
+        payment_deadline_ms=None,
+        unpaid_transaction_count=0,
+        http_status=200,
+        code=error.code,
+        sub_code=error.sub_code,
+        message=error.message,
+        mode=error.mode,
+        rc_code=error.rc_code,
+        rc_id=error.rc_id,
+        rc_show_id=error.rc_show_id,
     )
