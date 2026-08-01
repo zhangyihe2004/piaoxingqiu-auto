@@ -398,6 +398,14 @@ class CommandWorker:
                         else "不限"
                     )
                 )
+                lines.append(
+                    "选座："
+                    + (
+                        "位置优先"
+                        if binding["position_priority"]
+                        else "速度优先"
+                    )
+                )
             lines.extend(
                 (
                     f"{quantity_name}：{binding['quantity']} {quantity_unit}",

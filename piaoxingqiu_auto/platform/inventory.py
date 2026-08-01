@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import math
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlencode
 
@@ -19,6 +18,12 @@ from piaoxingqiu_auto.domain.seating import (
     Seat,
     SeatSelection,
     select_groups,
+)
+from piaoxingqiu_auto.domain.position import (
+    PositionScorer,
+    Venue,
+    index_seats,
+    venue_from_features,
 )
 
 if TYPE_CHECKING:
@@ -52,7 +57,8 @@ class StaticInventoryUnavailable(RuntimeError):
 class StaticLayout:
     resources: dict[str, str]
     plan_zones: dict[str, frozenset[str]]
-    zone_names: dict[str, str]
+    zone_aliases: dict[str, tuple[str, str]]
+    venue_url: str | None
 
 
 _STATIC_LAYOUTS: OrderedDict[str, StaticLayout] = OrderedDict()
@@ -60,6 +66,8 @@ _STATIC_LOADS: dict[str, asyncio.Task[StaticLayout]] = {}
 _STATIC_PREWARMS: set[tuple[str, tuple[str, ...]]] = set()
 _DECODED_RESOURCES: OrderedDict[str, tuple[Seat, ...]] = OrderedDict()
 _DECODE_LOADS: dict[str, asyncio.Task[tuple[Seat, ...]]] = {}
+_VENUES: OrderedDict[str, Venue] = OrderedDict()
+_VENUE_LOADS: dict[str, asyncio.Task[Venue]] = {}
 _DOWNLOAD_SEMAPHORE = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
 
 
@@ -283,21 +291,29 @@ class InventoryBootstrap:
     ) -> Inventory:
         zone_ids = _configured_zones(layout, self.plan_ids)
         if self.site.config.purchase.stand_names:
-            wanted = set(self.site.config.purchase.stand_names)
-            available = {layout.zone_names.get(zone_id) for zone_id in zone_ids}
-            if wanted <= available:
-                zone_ids = {
-                    zone_id
-                    for zone_id in zone_ids
-                    if layout.zone_names.get(zone_id) in wanted
-                }
+            matched = _match_stands(
+                layout,
+                zone_ids,
+                self.site.config.purchase.stand_names,
+            )
+            if matched is not None:
+                zone_ids = matched
+        position_priority = self.site.config.purchase.position_priority
+        venue = (
+            await _load_venue(self.site, layout.venue_url)
+            if position_priority
+            else None
+        )
+        preload_zones = set(zone_ids) if preload else set()
+        if position_priority and venue.center is None:
+            preload_zones.update(layout.resources)
         zones = (
             await _decode_zones(
                 layout.resources,
-                zone_ids,
+                preload_zones,
                 lambda url: _download_resource(self.site, url),
             )
-            if preload and zone_ids
+            if preload_zones
             else {}
         )
         return Inventory(
@@ -311,6 +327,7 @@ class InventoryBootstrap:
             resources=layout.resources,
             zone_ids=frozenset(zone_ids),
             zones=zones,
+            venue=venue,
         )
 
 @dataclass
@@ -325,6 +342,8 @@ class Inventory:
     resources: dict[str, str]
     zone_ids: frozenset[str]
     zones: dict[str, tuple[Seat, ...]]
+    venue: Venue | None
+    position: PositionScorer | None = None
     selection_queue: tuple[SeatSelection, ...] = ()
     rejected_seat_ids: set[str] = field(default_factory=set)
     plan_prices: dict[str, float] = field(default_factory=dict)
@@ -334,6 +353,7 @@ class Inventory:
     async def refresh(
         self,
         quantity: int,
+        blocked_seat_ids: frozenset[str] = frozenset(),
     ) -> SeatSelection:
         configured_zones = self.zone_ids - self.zones.keys()
         records, plan_inventory, decoded = await asyncio.gather(
@@ -413,22 +433,27 @@ class Inventory:
             )
 
         started = asyncio.get_running_loop().time()
-        available: dict[str, Candidate] = {}
+        available: list[Candidate] = []
         for (rank, plan_name, plan_id), bitsets in inventories.items():
             for zone_id, bits in bitsets.items():
                 for seat in self.zones[zone_id]:
                     if _bit_is_set(bits, seat.seat_no):
-                        available.setdefault(
-                            seat.seat_id,
-                            Candidate(seat, plan_name, plan_id, rank),
-                        )
+                        available.append(Candidate(seat, plan_name, plan_id, rank))
         if not available:
             raise RuntimeError("动态库存存在，但未能映射到静态座位")
-        for seat_id in self.rejected_seat_ids:
-            available.pop(seat_id, None)
+        if len({candidate.seat.seat_id for candidate in available}) != len(available):
+            raise RuntimeError("物理座位与基础票档映射不唯一")
+        available = [
+            candidate
+            for candidate in available
+            if candidate.seat.seat_id
+            not in self.rejected_seat_ids | blocked_seat_ids
+        ]
         if not available:
             raise InventoryUnavailable("刷新后没有未尝试的可售座位")
-        candidates = tuple(available.values())
+        candidates = tuple(available)
+        if self.position is None and self.venue is not None:
+            self.position = PositionScorer(self.venue, self.zones)
         counts = {
             plan_id: sum(candidate.plan_id == plan_id for candidate in candidates)
             for plan_id in self.plan_ids
@@ -450,7 +475,7 @@ class Inventory:
                         current_quantity,
                         plan_caps,
                         plan_units,
-                        self.selection_queue,
+                        self.position,
                     )
                 )
             ),
@@ -484,12 +509,8 @@ def _selection_queue(
     quantity: int,
     plan_caps: dict[str, int],
     plan_units: dict[str, int],
-    previous: tuple[SeatSelection, ...],
+    position: PositionScorer | None,
 ) -> tuple[SeatSelection, ...]:
-    live = {
-        (candidate.seat.seat_id, candidate.plan_id): candidate
-        for candidate in candidates
-    }
     queue: list[SeatSelection] = []
     seen: set[tuple[tuple[str, str], ...]] = set()
 
@@ -499,31 +520,14 @@ def _selection_queue(
             seen.add(key)
             queue.append(selection)
 
-    for selection in previous:
-        if len(selection.candidates) != quantity:
-            continue
-        refreshed = tuple(
-            live.get((candidate.seat.seat_id, candidate.plan_id))
-            for candidate in selection.candidates
-        )
-        refreshed_candidates = tuple(
-            candidate for candidate in refreshed if candidate is not None
-        )
-        if (
-            len(refreshed_candidates) == quantity
-            and _within_plan_caps(refreshed_candidates, plan_caps)
-            and _valid_plan_units(refreshed_candidates, plan_units)
-        ):
-            append(_selection(refreshed_candidates))
-
     for group in select_groups(
         candidates,
         quantity,
         plan_caps,
+        plan_units,
         limit=SELECTION_QUEUE_SIZE * 10,
+        score=position,
     ):
-        if not _valid_plan_units(group.candidates, plan_units):
-            continue
         append(_selection(group.candidates))
         if len(queue) == SELECTION_QUEUE_SIZE:
             break
@@ -548,24 +552,6 @@ def _selection_key(selection: SeatSelection) -> tuple[tuple[str, str], ...]:
             for candidate in selection.candidates
         )
     )
-
-
-def _within_plan_caps(
-    candidates: tuple[Candidate, ...],
-    plan_caps: dict[str, int],
-) -> bool:
-    counts: dict[str, int] = {}
-    for candidate in candidates:
-        counts[candidate.plan_id] = counts.get(candidate.plan_id, 0) + 1
-    return all(count <= plan_caps.get(plan_id, 0) for plan_id, count in counts.items())
-
-
-def _valid_plan_units(
-    candidates: tuple[Candidate, ...],
-    plan_units: dict[str, int],
-) -> bool:
-    counts = Counter(candidate.plan_id for candidate in candidates)
-    return all(count % plan_units.get(plan_id, 1) == 0 for plan_id, count in counts.items())
 
 
 async def _wait_inventory(load: Callable[[], Awaitable[T]]) -> T:
@@ -769,7 +755,7 @@ def _static_layout(data: dict[str, Any]) -> StaticLayout:
     if not resources:
         raise StaticInventoryUnavailable("静态座位资源尚未下发")
     plan_zones: dict[str, set[str]] = {}
-    zone_names: dict[str, str] = {}
+    zone_aliases: dict[str, tuple[str, str]] = {}
     for item in data.get("planZoneList", []):
         if not isinstance(item, dict) or not item.get("seatPlanId"):
             continue
@@ -781,18 +767,51 @@ def _static_layout(data: dict[str, Any]) -> StaticLayout:
         plan_zones.setdefault(str(item["seatPlanId"]), set()).update(
             str(zone["zoneConcreteId"]) for zone in zones
         )
-        zone_names.update(
-            {
-                str(zone["zoneConcreteId"]): str(zone.get("zoneName") or "").strip()
-                for zone in zones
-                if zone.get("zoneName")
-            }
-        )
+        for zone in zones:
+            zone_id = str(zone["zoneConcreteId"])
+            name = str(zone.get("zoneName") or "").strip()
+            full_name = str(zone.get("sectorName") or "").strip() + name
+            if name:
+                zone_aliases[zone_id] = full_name or name, name
+    venue_url = next(
+        (
+            str(item["url"])
+            for item in data.get("staticResList", [])
+            if isinstance(item, dict)
+            and item.get("dataType") == "VENUE_DATA"
+            and item.get("url")
+        ),
+        None,
+    )
     return StaticLayout(
         resources,
         {plan_id: frozenset(zones) for plan_id, zones in plan_zones.items()},
-        zone_names,
+        zone_aliases,
+        venue_url,
     )
+
+
+def _match_stands(
+    layout: StaticLayout,
+    zone_ids: set[str],
+    names: tuple[str, ...],
+) -> set[str] | None:
+    matched: set[str] = set()
+    for name in names:
+        exact = {
+            zone_id
+            for zone_id in zone_ids
+            if layout.zone_aliases.get(zone_id, ("", ""))[0] == name
+        }
+        exact = exact or {
+            zone_id
+            for zone_id in zone_ids
+            if layout.zone_aliases.get(zone_id, ("", ""))[1] == name
+        }
+        if not exact:
+            return None
+        matched.update(exact)
+    return matched
 
 
 def _configured_zones(
@@ -814,9 +833,9 @@ def available_stand_names(
     layout = _static_layout(data)
     return sorted(
         {
-            layout.zone_names[zone_id]
+            layout.zone_aliases[zone_id][0]
             for zone_id in _configured_zones(layout, plan_ids)
-            if zone_id in layout.zone_names
+            if zone_id in layout.zone_aliases
         }
     )
 
@@ -860,7 +879,7 @@ async def _decode_resource(
     async with _DOWNLOAD_SEMAPHORE:
         content = await download(url)
     features = geobuf.decode(content).get("features", [])
-    return _index_rows(
+    return index_seats(
         tuple(filter(None, (_seat(feature, zone_id) for feature in features)))
     )
 
@@ -906,29 +925,26 @@ def _row_name(properties: dict[str, Any]) -> str:
     return prefix + separator if separator else str(properties.get("row") or "")
 
 
-def _index_rows(seats: tuple[Seat, ...]) -> tuple[Seat, ...]:
-    rows: dict[str, list[Seat]] = {}
-    for seat in seats:
-        rows.setdefault(seat.row, []).append(seat)
-    indexes: dict[str, int] = {}
-    for row in rows.values():
-        axis = _principal_axis(row)
-        ordered = sorted(
-            row,
-            key=lambda seat: (seat.x * axis[0] + seat.y * axis[1], seat.seat_id),
-        )
-        indexes.update({seat.seat_id: index for index, seat in enumerate(ordered)})
-    return tuple(replace(seat, row_index=indexes[seat.seat_id]) for seat in seats)
+async def _load_venue(site: PurchasePage, url: str | None) -> Venue:
+    if url is None:
+        return venue_from_features([])
+    if venue := _cache_get(_VENUES, url):
+        return venue
+    task = _VENUE_LOADS.get(url)
+    if task is None:
+        async def load() -> Venue:
+            content = await _download_resource(site, url)
+            return venue_from_features(geobuf.decode(content).get("features", []))
 
-
-def _principal_axis(seats: list[Seat]) -> tuple[float, float]:
-    center_x = sum(seat.x for seat in seats) / len(seats)
-    center_y = sum(seat.y for seat in seats) / len(seats)
-    xx = sum((seat.x - center_x) ** 2 for seat in seats)
-    yy = sum((seat.y - center_y) ** 2 for seat in seats)
-    xy = sum((seat.x - center_x) * (seat.y - center_y) for seat in seats)
-    angle = math.atan2(2 * xy, xx - yy) / 2
-    return math.cos(angle), math.sin(angle)
+        task = asyncio.create_task(load())
+        _VENUE_LOADS[url] = task
+    try:
+        venue = await asyncio.shield(task)
+    finally:
+        if task.done() and _VENUE_LOADS.get(url) is task:
+            _VENUE_LOADS.pop(url, None)
+    _cache_put(_VENUES, url, venue, STATIC_LAYOUT_CACHE_SIZE)
+    return venue
 
 
 def _bit_is_set(bits: bytes, seat_no: int) -> bool:

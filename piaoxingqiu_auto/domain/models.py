@@ -37,6 +37,7 @@ class PurchaseConfig:
     quantity: int
     real_name_mode: str
     audiences: tuple[AudienceConfig, ...]
+    position_priority: bool = False
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,7 @@ class AccountRunConfig:
                 *self.purchase.plans,
                 *self.purchase.plan_ids,
                 *self.purchase.stand_names,
+                str(self.purchase.position_priority),
                 str(self.purchase.quantity),
                 self.purchase.real_name_mode,
                 *(f"{a.name}|{a.masked_id}" for a in self.purchase.audiences),

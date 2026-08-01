@@ -25,6 +25,7 @@ from piaoxingqiu_auto.domain.models import (
     AccountRunConfig,
     SystemConfig,
 )
+from piaoxingqiu_auto.domain.seating import SeatClaim, SessionSeatClaims
 from piaoxingqiu_auto.app.database import Database
 from piaoxingqiu_auto.adapters.feishu_gateway import FeishuGateway
 from piaoxingqiu_auto.platform.submission import PersistentOrderGuard, RiskEvent
@@ -108,6 +109,7 @@ class TaskScheduler:
         self.system = system
         self.operator = operator
         self.semaphore = asyncio.Semaphore(system.max_concurrent_accounts)
+        self.seat_claims = SessionSeatClaims()
         self.login_semaphore = asyncio.Semaphore(min(system.max_concurrent_accounts, 4))
         self.jobs: dict[int, asyncio.Task] = {}
         self.job_tasks: dict[int, int] = {}
@@ -903,6 +905,15 @@ class TaskScheduler:
                                 event,
                             )
                         ),
+                        seat_claim=(
+                            SeatClaim(
+                                self.seat_claims,
+                                str(task["session_id"]),
+                                f"{task_id}:{account_id}",
+                            )
+                            if task["support_seat_picking"]
+                            else None
+                        ),
                     )
             except asyncio.CancelledError:
                 current = self.db.get_binding(task_id, account_id)
@@ -1165,6 +1176,11 @@ class TaskScheduler:
         *,
         reason: str = "账号操作",
     ) -> None:
+        if (task := self.db.get_task(task_id)) and task["support_seat_picking"]:
+            await self.seat_claims.release(
+                str(task["session_id"]),
+                f"{task_id}:{account_id}",
+            )
         self._clear_stand_stock(task_id, account_id)
         pending = self.pending_notices.get(task_id)
         if pending:
@@ -1202,6 +1218,17 @@ class TaskScheduler:
     async def cancel_account(
         self, account_id: int, *, reason: str = "账号操作"
     ) -> None:
+        await asyncio.gather(
+            *(
+                self.seat_claims.release(
+                    str(task["session_id"]),
+                    f"{task['id']}:{account_id}",
+                )
+                for binding in self.db.list_bindings(account_id=account_id)
+                if (task := self.db.get_task(binding["task_id"]))
+                and task["support_seat_picking"]
+            )
+        )
         self.next_auth.pop(account_id, None)
         for task_id, current_account_id in tuple(self.stand_stock):
             if current_account_id == account_id:

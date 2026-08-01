@@ -31,6 +31,7 @@ class BindingSetupSession:
     account_id: int
     plan_ids: list[str]
     stands: list[str]
+    position_priority: bool
     quantity: int
     people: list[tuple[str, str]]
     last_message_id: str
@@ -103,6 +104,9 @@ class BindingSetupFlow:
                 row["stand_name"]
                 for row in self.db.get_binding_stands(task_id, account_id)
             ],
+            position_priority=(
+                bool(binding["position_priority"]) if binding else False
+            ),
             quantity=int(binding["quantity"]) if binding else 1,
             people=[
                 (row["name"], row["masked_id"])
@@ -135,6 +139,8 @@ class BindingSetupFlow:
             return await self._consume_plans(session, text)
         if session.phase == "STANDS":
             return self._consume_stands(session, text)
+        if session.phase == "POSITION":
+            return self._consume_position(session, text)
         if session.phase == "QUANTITY":
             return await self._consume_quantity(session, text)
         if session.phase == "PEOPLE":
@@ -183,6 +189,7 @@ class BindingSetupFlow:
             return self._plans_prompt(session, str(exc))
         if not self._task(session)["support_seat_picking"]:
             session.stands.clear()
+            session.position_priority = False
             session.phase = "QUANTITY"
             return self._quantity_prompt(session)
         try:
@@ -191,8 +198,8 @@ class BindingSetupFlow:
             return self._plans_prompt(session, f"读取看台失败：{exc}")
         if stands is not None and not stands:
             session.stands.clear()
-            session.phase = "QUANTITY"
-            return self._quantity_prompt(session)
+            session.phase = "POSITION"
+            return self._position_prompt(session)
         session.stand_options = tuple(stands or ())
         if session.stand_options:
             valid_names = set(session.stand_options)
@@ -232,6 +239,15 @@ class BindingSetupFlow:
             )
             if not session.stands:
                 return self._stands_prompt(session, "至少输入一个看台名。")
+        session.phase = "POSITION"
+        return self._position_prompt(session)
+
+    def _consume_position(
+        self, session: BindingSetupSession, text: str
+    ) -> str:
+        if text not in {"1", "2"}:
+            return self._position_prompt(session, "请发送 1 或 2。")
+        session.position_priority = text == "2"
         session.phase = "QUANTITY"
         return self._quantity_prompt(session)
 
@@ -301,6 +317,7 @@ class BindingSetupFlow:
                 session.account_id,
                 session.plan_ids,
                 session.stands,
+                session.position_priority,
                 session.quantity,
                 session.people,
             )
@@ -393,6 +410,27 @@ class BindingSetupFlow:
         )
         return "\n".join(lines)
 
+    def _position_prompt(
+        self, session: BindingSetupSession, notice: str = ""
+    ) -> str:
+        lines = [
+            f"绑定任务 #{session.task_id}｜账号 #{session.account_id}",
+            "选座策略",
+        ]
+        if notice:
+            lines.extend(("", notice))
+        lines.extend(
+            (
+                "",
+                "1. 速度优先",
+                "2. 位置优先",
+                "",
+                "发送：1 或 2",
+                "退出：取消",
+            )
+        )
+        return "\n".join(lines)
+
     def _people_prompt(
         self, session: BindingSetupSession, notice: str = ""
     ) -> str:
@@ -436,6 +474,11 @@ class BindingSetupFlow:
             lines.insert(
                 1,
                 f"看台：{'、'.join(session.stands) if session.stands else '不限'}",
+            )
+            lines.insert(
+                2,
+                "选座："
+                + ("位置优先" if session.position_priority else "速度优先"),
             )
         if session.people:
             lines.append(f"观演人（{len(session.people)}）：")

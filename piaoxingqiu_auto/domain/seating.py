@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import heapq
 import math
 import secrets
+from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 
 
@@ -44,7 +47,7 @@ class SeatGroup:
             for anchor in seats
             if (distances := tuple(_distance(anchor.seat, item.seat) for item in seats))
         )
-        return compactness + plan_priority
+        return plan_priority + compactness
 
 
 @dataclass(frozen=True)
@@ -52,12 +55,85 @@ class SeatSelection:
     candidates: tuple[Candidate, ...]
 
 
+GroupScore = Callable[[SeatGroup], tuple]
+
+
+class SessionSeatClaims:
+    """同一进程内原子隔离同场次各绑定正在提交的座位。"""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owners: dict[tuple[str, str], str] = {}
+
+    async def claim_first(
+        self,
+        session_id: str,
+        owner: str,
+        selections: tuple[SeatSelection, ...],
+    ) -> SeatSelection | None:
+        async with self._lock:
+            for selection in selections:
+                keys = tuple(
+                    (session_id, candidate.seat.seat_id)
+                    for candidate in selection.candidates
+                )
+                if all(
+                    self._owners.get(key) in {None, owner}
+                    for key in keys
+                ):
+                    self._release(session_id, owner)
+                    self._owners.update(dict.fromkeys(keys, owner))
+                    return selection
+        return None
+
+    async def release(self, session_id: str, owner: str) -> None:
+        async with self._lock:
+            self._release(session_id, owner)
+
+    async def blocked(self, session_id: str, owner: str) -> frozenset[str]:
+        async with self._lock:
+            return frozenset(
+                seat_id
+                for (current_session, seat_id), current_owner in self._owners.items()
+                if current_session == session_id and current_owner != owner
+            )
+
+    def _release(self, session_id: str, owner: str) -> None:
+        for key in tuple(self._owners):
+            if key[0] == session_id and self._owners[key] == owner:
+                del self._owners[key]
+
+
+@dataclass(frozen=True)
+class SeatClaim:
+    registry: SessionSeatClaims
+    session_id: str
+    owner: str
+
+    async def claim_first(
+        self, selections: tuple[SeatSelection, ...]
+    ) -> SeatSelection | None:
+        return await self.registry.claim_first(
+            self.session_id,
+            self.owner,
+            selections,
+        )
+
+    async def blocked(self) -> frozenset[str]:
+        return await self.registry.blocked(self.session_id, self.owner)
+
+    async def release(self) -> None:
+        await self.registry.release(self.session_id, self.owner)
+
+
 def select_groups(
     candidates: tuple[Candidate, ...],
     quantity: int,
-    plan_caps: dict[str, int] | None = None,
+    plan_caps: dict[str, int],
+    plan_units: dict[str, int],
     *,
     limit: int = 10,
+    score: GroupScore | None = None,
 ) -> tuple[SeatGroup, ...]:
     if quantity < 1 or limit < 1:
         return ()
@@ -65,7 +141,7 @@ def select_groups(
     seen: set[tuple[str, ...]] = set()
 
     def append(groups: list[SeatGroup]) -> None:
-        for group in _rank_groups(groups, limit - len(ranked)):
+        for group in _rank_groups(groups, limit - len(ranked), score):
             key = tuple(
                 sorted(candidate.seat.seat_id for candidate in group.candidates)
             )
@@ -75,7 +151,7 @@ def select_groups(
                 if len(ranked) == limit:
                     return
 
-    append(_continuous_groups(candidates, quantity, plan_caps))
+    append(_continuous_groups(candidates, quantity, plan_caps, plan_units))
     if len(ranked) == limit:
         return tuple(ranked)
     by_zone: dict[str, list[Candidate]] = {}
@@ -90,6 +166,7 @@ def select_groups(
             quantity,
             cohesion=1,
             plan_caps=plan_caps,
+            plan_units=plan_units,
         )
     ]
     append(same_zone)
@@ -100,6 +177,7 @@ def select_groups(
                 quantity,
                 cohesion=2,
                 plan_caps=plan_caps,
+                plan_units=plan_units,
             )
         )
     return tuple(ranked)
@@ -108,7 +186,8 @@ def select_groups(
 def _continuous_groups(
     candidates: tuple[Candidate, ...],
     quantity: int,
-    plan_caps: dict[str, int] | None = None,
+    plan_caps: dict[str, int],
+    plan_units: dict[str, int],
 ) -> list[SeatGroup]:
     rows: dict[tuple[str, str], list[Candidate]] = {}
     for candidate in candidates:
@@ -121,10 +200,10 @@ def _continuous_groups(
         run: list[Candidate] = []
         for candidate in ordered:
             if run and candidate.seat.row_index != run[-1].seat.row_index + 1:
-                _append_windows(groups, run, quantity, plan_caps)
+                _append_windows(groups, run, quantity, plan_caps, plan_units)
                 run = []
             run.append(candidate)
-        _append_windows(groups, run, quantity, plan_caps)
+        _append_windows(groups, run, quantity, plan_caps, plan_units)
     return groups
 
 
@@ -132,11 +211,12 @@ def _append_windows(
     groups: list[SeatGroup],
     run: list[Candidate],
     quantity: int,
-    plan_caps: dict[str, int] | None,
+    plan_caps: dict[str, int],
+    plan_units: dict[str, int],
 ) -> None:
     for start in range(len(run) - quantity + 1):
         candidates = tuple(run[start : start + quantity])
-        if _within_caps(candidates, plan_caps):
+        if valid_selection(candidates, plan_caps, plan_units):
             groups.append(SeatGroup(cohesion=0, candidates=candidates))
 
 
@@ -145,48 +225,63 @@ def _compact_groups(
     quantity: int,
     *,
     cohesion: int,
-    plan_caps: dict[str, int] | None = None,
+    plan_caps: dict[str, int],
+    plan_units: dict[str, int],
 ) -> list[SeatGroup]:
     if len(candidates) < quantity:
         return []
+    by_plan: dict[str, list[Candidate]] = {}
+    for candidate in candidates:
+        by_plan.setdefault(candidate.plan_id, []).append(candidate)
     groups: dict[tuple[str, ...], SeatGroup] = {}
     for anchor in candidates:
-        ordered = heapq.nsmallest(
-            len(candidates),
-            candidates,
-            key=lambda candidate: _distance(anchor.seat, candidate.seat),
-        )
-        counts: dict[str, int] = {}
-        nearest_list: list[Candidate] = []
-        for candidate in ordered:
-            count = counts.get(candidate.plan_id, 0)
-            if plan_caps is not None and count >= plan_caps.get(candidate.plan_id, 0):
-                continue
-            nearest_list.append(candidate)
-            counts[candidate.plan_id] = count + 1
-            if len(nearest_list) == quantity:
-                break
-        if len(nearest_list) < quantity:
+        choices: dict[int, tuple[Candidate, ...]] = {0: ()}
+        for plan_id, plan_candidates in by_plan.items():
+            ordered = heapq.nsmallest(
+                min(len(plan_candidates), quantity),
+                plan_candidates,
+                key=lambda candidate: _distance(anchor.seat, candidate.seat),
+            )
+            unit = plan_units.get(plan_id, 1)
+            cap = min(len(ordered), plan_caps.get(plan_id, 0), quantity)
+            updated: dict[int, tuple[Candidate, ...]] = {}
+            for total, selected in choices.items():
+                for count in range(0, min(cap, quantity - total) + 1, unit):
+                    combined = selected + tuple(ordered[:count])
+                    size = total + count
+                    previous = updated.get(size)
+                    if previous is None or SeatGroup(
+                        cohesion, combined
+                    ).score < SeatGroup(cohesion, previous).score:
+                        updated[size] = combined
+            choices = updated
+        nearest = choices.get(quantity)
+        if nearest is None:
             continue
-        nearest = tuple(nearest_list)
         key = tuple(sorted(candidate.seat.seat_id for candidate in nearest))
         groups[key] = SeatGroup(cohesion=cohesion, candidates=nearest)
     return list(groups.values())
 
 
-def _within_caps(
+def valid_selection(
     candidates: tuple[Candidate, ...],
-    plan_caps: dict[str, int] | None,
+    plan_caps: dict[str, int],
+    plan_units: dict[str, int],
 ) -> bool:
-    if plan_caps is None:
-        return True
-    counts: dict[str, int] = {}
-    for candidate in candidates:
-        counts[candidate.plan_id] = counts.get(candidate.plan_id, 0) + 1
-    return all(count <= plan_caps.get(plan_id, 0) for plan_id, count in counts.items())
+    counts = Counter(candidate.plan_id for candidate in candidates)
+    return counts <= Counter(plan_caps) and all(
+        count % plan_units.get(plan_id, 1) == 0
+        for plan_id, count in counts.items()
+    )
 
 
-def _rank_groups(groups: list[SeatGroup], limit: int) -> list[SeatGroup]:
+def _rank_groups(
+    groups: list[SeatGroup],
+    limit: int,
+    score: GroupScore | None,
+) -> list[SeatGroup]:
+    if score is not None:
+        return sorted(groups, key=score)[:limit]
     by_score: dict[tuple, list[SeatGroup]] = {}
     for group in groups:
         by_score.setdefault(group.score, []).append(group)

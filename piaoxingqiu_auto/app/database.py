@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS bindings (
     task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     quantity INTEGER NOT NULL DEFAULT 1,
+    position_priority INTEGER NOT NULL DEFAULT 0,
     enabled INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'STOPPED',
     order_id TEXT,
@@ -573,6 +574,7 @@ class Database:
         account_id: int,
         plan_ids: list[str],
         stands: list[str],
+        position_priority: bool,
         quantity: int,
         people: list[tuple[str, str]],
     ) -> None:
@@ -638,21 +640,23 @@ class Database:
                 self.connection.execute(
                     """
                     UPDATE bindings
-                    SET quantity = ?, enabled = 0, status = 'STOPPED',
+                    SET quantity = ?, position_priority = ?,
+                        enabled = 0, status = 'STOPPED',
                         order_id = NULL, last_error = '', updated_at = ?
                     WHERE task_id = ? AND account_id = ?
                     """,
-                    (quantity, now, task_id, account_id),
+                    (quantity, int(position_priority), now, task_id, account_id),
                 )
             else:
                 self.connection.execute(
                     """
                     INSERT INTO bindings (
-                        task_id, account_id, quantity, enabled, status,
+                        task_id, account_id, quantity, position_priority,
+                        enabled, status,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, 0, 'STOPPED', ?, ?)
+                    ) VALUES (?, ?, ?, ?, 0, 'STOPPED', ?, ?)
                     """,
-                    (task_id, account_id, quantity, now, now),
+                    (task_id, account_id, quantity, int(position_priority), now, now),
                 )
             self.connection.execute(
                 "DELETE FROM binding_plans WHERE task_id = ? AND account_id = ?",

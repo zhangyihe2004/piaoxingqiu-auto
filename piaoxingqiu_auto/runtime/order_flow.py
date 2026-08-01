@@ -14,7 +14,7 @@ from playwright.async_api import Page
 from piaoxingqiu_auto.domain.models import AccountRunConfig
 from piaoxingqiu_auto.domain.outcomes import RunResult
 from piaoxingqiu_auto.domain.sale import SaleUnavailable
-from piaoxingqiu_auto.domain.seating import SeatSelection
+from piaoxingqiu_auto.domain.seating import SeatClaim, SeatSelection
 from piaoxingqiu_auto.platform.auth import AuthGuard, AuthenticationRequired
 from piaoxingqiu_auto.platform.cart import CartClient, CartOrder, CartRejected
 from piaoxingqiu_auto.platform.booking import PurchasePage
@@ -58,6 +58,7 @@ async def run_account(
     sale_signal: Awaitable[None] | None = None,
     seat_available: Callable[[], None] | None = None,
     risk_notice: RiskNotice | None = None,
+    seat_claim: SeatClaim | None = None,
 ) -> RunResult:
     """执行一个账号的一次自动抢票生命周期，最多创建一个订单。"""
     if not config.create_order:
@@ -76,8 +77,9 @@ async def run_account(
             slot_acquired = True
             log.info("%s 获得创建执行权", trace_label or config.project.name)
 
+    result: RunResult | None = None
     try:
-        return await _run_account(
+        result = await _run_account(
             config,
             page,
             submission,
@@ -89,8 +91,15 @@ async def run_account(
             sale_signal=sale_signal,
             seat_available=seat_available,
             risk_notice=risk_notice,
+            seat_claim=seat_claim,
         )
+        return result
     finally:
+        if (
+            seat_claim is not None
+            and (result is None or result.status not in {"CREATED", "UNKNOWN"})
+        ):
+            await seat_claim.release()
         if slot_acquired:
             execution_gate.release()
         await submission.detach()
@@ -126,6 +135,7 @@ async def _run_account(
     sale_signal: Awaitable[None] | None,
     seat_available: Callable[[], None] | None,
     risk_notice: RiskNotice | None,
+    seat_claim: SeatClaim | None,
 ) -> RunResult:
     timings = RunTimings(trace_label or config.project.name)
     site = PurchasePage(page, config, timings.record)
@@ -158,6 +168,7 @@ async def _run_account(
                 prewarm,
                 acquire_execution,
                 sale_signal,
+                seat_claim,
             )
             if seat_available is not None:
                 seat_available()
@@ -168,6 +179,7 @@ async def _run_account(
                 people,
                 ticket_quantity,
                 site,
+                seat_claim,
             )
             selected_ticket_count = len(selection.candidates)
             selected_order_quantity = selected_ticket_count
@@ -380,7 +392,11 @@ async def _run_account(
                 if recovery == "REBUILD":
                     await site.open_purchase()
                 ticket_quantity = order_quantity
-                selection = await seat_source.refresh(ticket_quantity)
+                selection = await _refresh_claimed(
+                    seat_source,
+                    ticket_quantity,
+                    seat_claim,
+                )
                 selection, prepared = await _prepare_seats(
                     cart,
                     seat_source,
@@ -388,6 +404,7 @@ async def _run_account(
                     people,
                     ticket_quantity,
                     site,
+                    seat_claim,
                 )
                 selected_ticket_count = len(selection.candidates)
                 selected_order_quantity = selected_ticket_count
@@ -455,32 +472,36 @@ async def _prepare_seat_selection(
     prewarm: bool,
     acquire_execution: Callable[[], Awaitable[None]],
     sale_signal: Awaitable[None] | None,
+    seat_claim: SeatClaim | None,
 ) -> tuple[Inventory, SeatSelection]:
     bootstrap = InventoryBootstrap.open(site, auth)
     if prewarm:
         await cart.warm(site.config.purchase.audiences)
         await _wait_sale(sale_signal)
 
-    await acquire_execution()
     timings.begin(1)
 
-    async def load():
+    async def load() -> Inventory:
         current = await bootstrap.activate()
-        selection = (
+        if prewarm:
             await current.wait_available(quantity)
-            if prewarm
-            else await current.refresh(quantity)
-        )
-        return current, selection
+        else:
+            await current.refresh(quantity)
+        return current
 
     if prewarm:
-        source, selection = await load()
+        source = await load()
     else:
-        (source, selection), _ = await asyncio.gather(
+        source, _ = await asyncio.gather(
             load(),
             site.prepare_booking(),
         )
-    return source, selection
+    await acquire_execution()
+    return source, await _claim_selection(
+        source,
+        quantity,
+        seat_claim,
+    )
 
 
 async def _prepare_seats(
@@ -490,14 +511,49 @@ async def _prepare_seats(
     people,
     quantity: int,
     site: PurchasePage,
+    claim: SeatClaim | None,
 ) -> tuple[SeatSelection, CartOrder]:
     return await _prepare_cart(
         selection,
         lambda current: cart.prepare_seats(current, source, people),
-        lambda: source.refresh(quantity),
+        lambda: _refresh_claimed(
+            source,
+            quantity,
+            claim,
+        ),
         source.reject,
         site,
     )
+
+
+async def _refresh_claimed(
+    source: Inventory,
+    quantity: int,
+    claim: SeatClaim | None,
+) -> SeatSelection:
+    blocked = await claim.blocked() if claim is not None else frozenset()
+    await source.refresh(quantity, blocked)
+    return await _claim_selection(
+        source,
+        quantity,
+        claim,
+    )
+
+
+async def _claim_selection(
+    source: Inventory,
+    quantity: int,
+    claim: SeatClaim | None,
+) -> SeatSelection:
+    if claim is None:
+        return source.selection_queue[0]
+    claimed = await claim.claim_first(source.selection_queue)
+    if claimed is None:
+        await source.refresh(quantity, await claim.blocked())
+        claimed = await claim.claim_first(source.selection_queue)
+    if claimed is None:
+        raise InventoryUnavailable("可售座位正在由同场次其他账号提交")
+    return claimed
 
 
 async def _prepare_general(
