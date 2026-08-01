@@ -262,8 +262,8 @@ def _points(values: Any) -> tuple[Point, ...]:
         for point in values
         if isinstance(point, list)
         and len(point) >= 2
-        and isinstance(point[0], (int, float))
-        and isinstance(point[1], (int, float))
+        and isinstance(point[0], int | float)
+        and isinstance(point[1], int | float)
     )
 
 

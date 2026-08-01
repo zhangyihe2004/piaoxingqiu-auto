@@ -56,7 +56,7 @@ def sale_time(value: Any) -> int | None:
     candidates = {
         int(item)
         for item in _walk_sale_times(value)
-        if isinstance(item, (int, float)) and item > 1_000_000_000_000
+        if isinstance(item, int | float) and item > 1_000_000_000_000
     }
     return candidates.pop() if len(candidates) == 1 else None
 

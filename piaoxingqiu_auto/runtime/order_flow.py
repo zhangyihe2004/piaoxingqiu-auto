@@ -93,7 +93,6 @@ async def run_account(
             risk_notice=risk_notice,
             seat_claim=seat_claim,
         )
-        return result
     finally:
         if (
             seat_claim is not None
@@ -103,6 +102,7 @@ async def run_account(
         if slot_acquired:
             execution_gate.release()
         await submission.detach()
+    return result
 
 
 async def warm_account(

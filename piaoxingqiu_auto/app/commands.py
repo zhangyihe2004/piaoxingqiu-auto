@@ -34,7 +34,6 @@ HELP = """票星球自动抢票
 
 【创建】
 搜索 <关键词>
-抢票 <搜索序号>
 
 【查看】
 列表
@@ -122,14 +121,9 @@ class CommandWorker:
             await asyncio.sleep(REPLY_RETRY_SECONDS)
             await self.configurator.expire()
             cutoff = time.monotonic() - SEARCH_TTL
-            self.searches = {
-                key: value for key, value in self.searches.items() if value[0] > cutoff
-            }
-            self.session_choices = {
-                key: value
-                for key, value in self.session_choices.items()
-                if key in self.searches
-            }
+            for key, value in tuple(self.searches.items()):
+                if value[0] <= cutoff:
+                    self._clear_creation(key)
             await self._retry_replies()
 
     async def _retry_replies(self) -> None:
@@ -147,6 +141,9 @@ class CommandWorker:
         response = await self._consume_session_choice(command)
         if response is not None:
             return response
+        response = await self._consume_search_choice(command)
+        if response is not None:
+            return response
         try:
             parts = shlex.split(command.text)
         except ValueError as exc:
@@ -158,8 +155,6 @@ class CommandWorker:
             return "无操作权限。"
         if name == "搜索":
             return await self._search(command, parts)
-        if name == "抢票":
-            return await self._create(command, parts)
         if name == "列表":
             return self._tasks()
         if name == "详情":
@@ -188,13 +183,18 @@ class CommandWorker:
     def _key(command: IncomingCommand) -> tuple[str, str]:
         return command.chat_id, command.sender_open_id
 
+    def _clear_creation(self, key: tuple[str, str]) -> None:
+        self.searches.pop(key, None)
+        self.session_choices.pop(key, None)
+
     async def _search(self, command: IncomingCommand, parts: list[str]) -> str:
         if len(parts) < 2:
             return "发送：搜索 <关键词>"
         shows = await self.service.search(" ".join(parts[1:]))
-        self.searches[self._key(command)] = (time.monotonic(), shows)
         if not shows:
             return "搜索结果（0）\n请缩短关键词或改用演出名称中的连续文字重试。"
+        if command.is_admin:
+            self.searches[self._key(command)] = (time.monotonic(), shows)
         lines = [f"搜索结果（{len(shows)}）"]
         for index, show in enumerate(shows, 1):
             lines.extend(
@@ -206,35 +206,35 @@ class CommandWorker:
                     f"实名：{real_name_label(show.get('_real_name_mode', 'NONE'))}",
                 )
             )
-        lines.extend(("", "发送：抢票 <搜索序号>"))
+        if command.is_admin:
+            lines.extend(("", "发送：<搜索序号>", "退出：取消"))
         return "\n".join(lines)
 
-    def _search_show(self, command: IncomingCommand, value: str) -> dict | None:
-        if not value.isdigit():
+    async def _consume_search_choice(
+        self, command: IncomingCommand
+    ) -> str | None:
+        key = self._key(command)
+        cached = self.searches.get(key)
+        if cached is None:
             return None
-        cached = self.searches.get(self._key(command))
-        if not cached:
-            return None
+        text = command.text.strip()
         if time.monotonic() - cached[0] >= SEARCH_TTL:
-            self.searches.pop(self._key(command), None)
-            return None
-        index = int(value)
-        if 1 <= index <= len(cached[1]):
-            return cached[1][index - 1]
-        return None
-
-    async def _create(self, command: IncomingCommand, parts: list[str]) -> str:
-        if len(parts) != 2:
-            return "发送：抢票 <搜索序号>"
-        show = self._search_show(command, parts[1])
-        if not show:
-            return "搜索序号无效或结果已过期，请重新搜索。"
+            self._clear_creation(key)
+            return "搜索结果已过期，请重新搜索。" if text.isdigit() else None
+        if text == "取消":
+            self._clear_creation(key)
+            return "已取消创建任务。"
+        shows = cached[1]
+        if not text.isdigit() or not 1 <= int(text) <= len(shows):
+            return f"请发送 1~{len(shows)} 的搜索序号；退出：取消"
+        show = shows[int(text) - 1]
         show_id = str(show.get("showId") or "")
         show_name, sessions = await self.service.show_sessions(show_id)
         if not sessions:
+            self._clear_creation(key)
             return "该演出当前没有场次。"
         if len(sessions) > 1:
-            self.session_choices[self._key(command)] = (
+            self.session_choices[key] = (
                 show,
                 show_name,
                 sessions,
@@ -246,6 +246,7 @@ class CommandWorker:
             )
             lines.extend(("", "发送：<场次序号>", "退出：取消"))
             return "\n".join(lines)
+        self._clear_creation(key)
         return await self._create_task(show, show_name, sessions[0])
 
     async def _consume_session_choice(
@@ -257,12 +258,12 @@ class CommandWorker:
             return None
         text = command.text.strip()
         if text == "取消":
-            self.session_choices.pop(key, None)
+            self._clear_creation(key)
             return "已取消创建任务。"
         show, show_name, sessions = pending
         if not text.isdigit() or not 1 <= int(text) <= len(sessions):
             return f"请发送 1~{len(sessions)} 的场次序号；退出：取消"
-        self.session_choices.pop(key, None)
+        self._clear_creation(key)
         return await self._create_task(show, show_name, sessions[int(text) - 1])
 
     async def _create_task(

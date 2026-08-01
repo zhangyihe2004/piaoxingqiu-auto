@@ -549,7 +549,7 @@ def _scalar(value: object, *keys: str) -> str | None:
         return None
     for key in keys:
         item = value.get(key)
-        if isinstance(item, (str, int, float)):
+        if isinstance(item, str | int | float):
             return str(item)
     return None
 
@@ -559,7 +559,7 @@ def _header(value: object, name: str) -> str | None:
         return None
     target = name.lower()
     for key, item in value.items():
-        if str(key).lower() == target and isinstance(item, (str, int, float)):
+        if str(key).lower() == target and isinstance(item, str | int | float):
             return str(item)
     return None
 

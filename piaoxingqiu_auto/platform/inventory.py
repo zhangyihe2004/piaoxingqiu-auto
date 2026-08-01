@@ -436,9 +436,11 @@ class Inventory:
         available: list[Candidate] = []
         for (rank, plan_name, plan_id), bitsets in inventories.items():
             for zone_id, bits in bitsets.items():
-                for seat in self.zones[zone_id]:
-                    if _bit_is_set(bits, seat.seat_no):
-                        available.append(Candidate(seat, plan_name, plan_id, rank))
+                available.extend(
+                    Candidate(seat, plan_name, plan_id, rank)
+                    for seat in self.zones[zone_id]
+                    if _bit_is_set(bits, seat.seat_no)
+                )
         if not available:
             raise RuntimeError("动态库存存在，但未能映射到静态座位")
         if len({candidate.seat.seat_id for candidate in available}) != len(available):

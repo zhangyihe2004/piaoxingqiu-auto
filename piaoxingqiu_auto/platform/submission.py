@@ -9,7 +9,7 @@ import re
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
@@ -135,7 +135,7 @@ class PersistentOrderGuard:
         return OrderState(
             plan_key=self.plan_key,
             status=status,
-            updated_at=datetime.now(timezone.utc).isoformat(),
+            updated_at=datetime.now(UTC).isoformat(),
             order_id=order_id,
         )
 
@@ -561,7 +561,7 @@ def _find_scalar(payload: object, keys: tuple[str, ...]) -> str | None:
     if isinstance(payload, dict):
         for key in keys:
             value = payload.get(key)
-            if isinstance(value, (str, int, float, bool)):
+            if isinstance(value, str | int | float | bool):
                 return str(value)
         for value in payload.values():
             found = _find_scalar(value, keys)
@@ -597,14 +597,14 @@ def _cart_create_details(
 
 
 def _string_value(value: object) -> str | None:
-    if not isinstance(value, (str, int)):
+    if not isinstance(value, str | int):
         return None
     result = str(value)
     return result or None
 
 
 def _positive_int(value: object) -> int | None:
-    if not isinstance(value, (str, int)):
+    if not isinstance(value, str | int):
         return None
     try:
         result = int(value)

@@ -58,7 +58,7 @@ class PxqClient:
             raw_status = payload.get("statusCode")
             status_code = (
                 int(raw_status)
-                if isinstance(raw_status, (int, str)) and str(raw_status).isdigit()
+                if isinstance(raw_status, int | str) and str(raw_status).isdigit()
                 else None
             )
             comments = str(payload.get("comments") or "")

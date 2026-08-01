@@ -88,9 +88,7 @@ class AuthGuard:
         payload = await response.json()
         if not isinstance(payload, dict):
             raise AuthenticationError("登录检查响应不是 JSON 对象")
-        if str(payload.get("statusCode")) != "200":
-            return False
-        return True
+        return str(payload.get("statusCode")) == "200"
 
     async def audiences(self) -> tuple[OfficialAudience, ...]:
         await self.ensure()
