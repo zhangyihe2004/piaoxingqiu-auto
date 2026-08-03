@@ -238,7 +238,7 @@ async def _run_account(
         action = create_failure_action(result)
         timings.finish(f"PRE_ORDER_{result.code or 'FAILED'}")
         return RunResult(
-            "STOP_BINDING" if action == "STOP_BINDING" else "FAILED",
+            _failure_status(action),
             _preorder_diagnostic(result),
             reuse_page=result.risk_state is not None,
         )
@@ -300,6 +300,8 @@ async def _run_account(
             )
 
         action = create_failure_action(result)
+        if action == "RETRY" and not prewarm:
+            action = "FAILED"
         diagnostic = _create_diagnostic(result)
         log.info("创建请求第 %s 次失败：%s", attempt, diagnostic)
         if action == "UNKNOWN":
@@ -316,6 +318,13 @@ async def _run_account(
             return RunResult(
                 "STOP_BINDING",
                 f"票星球拒绝继续自动提交，订单未创建：{diagnostic}",
+                removed_audiences=tuple(removed),
+                fulfilled_quantity=fulfilled_quantity,
+            )
+        if action == "NEEDS_LOGIN":
+            return RunResult(
+                "NEEDS_LOGIN",
+                f"登录状态已失效：{diagnostic}",
                 removed_audiences=tuple(removed),
                 fulfilled_quantity=fulfilled_quantity,
             )
@@ -430,7 +439,7 @@ async def _run_account(
             action = create_failure_action(rejected)
             timings.finish(f"RECOVER_PRE_ORDER_{rejected.code or 'FAILED'}")
             return RunResult(
-                "STOP_BINDING" if action == "STOP_BINDING" else "FAILED",
+                _failure_status(action),
                 _preorder_diagnostic(rejected, recovery=True),
                 removed_audiences=tuple(removed),
                 fulfilled_quantity=fulfilled_quantity,
@@ -687,10 +696,27 @@ async def _save_failure(
 
 
 def _create_diagnostic(result: CreateResult) -> str:
-    return (
+    diagnostic = (
         f"HTTP={result.http_status} code={result.code or '无'} "
         f"subCode={result.sub_code or '无'} message={result.message or '无'}"
     )
+    extra = " ".join(
+        f"{name}={value}"
+        for name, value in (
+            ("mode", result.mode),
+            ("rc-code", result.rc_code),
+            ("rc-id", result.rc_id),
+            ("rc-show-id", result.rc_show_id),
+        )
+        if value
+    )
+    return f"{diagnostic} {extra}" if extra else diagnostic
+
+
+def _failure_status(action: str) -> str:
+    if action in {"STOP_BINDING", "NEEDS_LOGIN"}:
+        return action
+    return "FAILED"
 
 
 def _preorder_diagnostic(

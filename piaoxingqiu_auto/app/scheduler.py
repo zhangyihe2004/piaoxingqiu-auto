@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from collections.abc import Awaitable
 from contextlib import asynccontextmanager, suppress
@@ -56,6 +57,7 @@ from piaoxingqiu_auto.app.tasks import (
 log = logging.getLogger("piaoxingqiu.auto")
 ERROR_ALERT_COOLDOWN = 3600.0
 MAX_BACKOFF_FACTOR = 16
+DAILY_POLL_JITTER = 0.2
 # 状态轮询不应阻塞真正抢票，但也不让大量任务同时打接口。
 MAX_CONCURRENT_POLLS = 4
 NOTICE_RETRY_SECONDS = 10.0
@@ -656,7 +658,10 @@ class TaskScheduler:
         if watcher is not None and not watcher.done():
             self.next_poll[task_id] = float("inf")
             return
-        delay = float(task["interval_sec"])
+        delay = float(task["interval_sec"]) * random.uniform(
+            1 - DAILY_POLL_JITTER,
+            1 + DAILY_POLL_JITTER,
+        )
         delay *= min(2 ** self.failures.get(task_id, 0), MAX_BACKOFF_FACTOR)
         if task["session_status"] == "PENDING" and task["sale_time_ms"] is not None:
             remaining = (task["sale_time_ms"] - int(time.time() * 1000)) / 1000

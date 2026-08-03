@@ -26,7 +26,10 @@ RiskStage = Literal["PRE_ORDER", "CREATE_ORDER"]
 FailureAction = Literal[
     "RESELECT",
     "REBUILD",
+    "REPRICE",
+    "RETRY",
     "REMOVE_AUDIENCE",
+    "NEEDS_LOGIN",
     "STOP_BINDING",
     "FAILED",
     "UNKNOWN",
@@ -36,12 +39,26 @@ CART_CREATE_PATH = "/cyy_gatewayapi/trade/buyer/order/cart/v1/create_order"
 CREATE_ROUTE = "**/trade/buyer/order/cart/v1/create_order*"
 QUEUE_CODE = "33007201"
 VERIFY_CODE = "33007202"
+TOKEN_EXPIRED_CODE = "15012010"
 LIMITING_MODE = "limiting"
 LIMITING_INTERVAL_SECONDS = 3
 MAX_LIMITING_RETRIES = 3
 MAX_LEASE_REQUESTS = 6
 RISK_WAIT_SECONDS = 300
 SUCCESS_CODES = {"0", "200", "200000"}
+
+MODE_NAMES = {
+    "0": "none",
+    "1": "toast",
+    "2": "alert",
+    "3": "login",
+    "4": "back",
+    "5": "waiting",
+    "8": "back_refresh",
+    "9": LIMITING_MODE,
+    "10": "retry",
+    "11": "booking",
+}
 
 CREATE_FAILURE_ACTIONS: dict[str, FailureAction] = {
     "22035010": "RESELECT",
@@ -51,7 +68,27 @@ CREATE_FAILURE_ACTIONS: dict[str, FailureAction] = {
     "27902319": "REMOVE_AUDIENCE",
     "27902332": "STOP_BINDING",
     "28217767": "STOP_BINDING",
-    "32713071": "STOP_BINDING",
+    "12501099": "REPRICE",
+    "22037056": "REPRICE",
+    "22037057": "REPRICE",
+    "32713071": "REPRICE",
+    "10002008": "NEEDS_LOGIN",
+    "15012002": "NEEDS_LOGIN",
+    "15012007": "NEEDS_LOGIN",
+    "15012008": "NEEDS_LOGIN",
+    "15012009": "NEEDS_LOGIN",
+    "15012010": "NEEDS_LOGIN",
+}
+
+MODE_FAILURE_ACTIONS: dict[str, FailureAction] = {
+    "toast": "FAILED",
+    "alert": "FAILED",
+    "login": "NEEDS_LOGIN",
+    "back": "REBUILD",
+    "waiting": "FAILED",
+    "back_refresh": "REBUILD",
+    "retry": "FAILED",
+    "booking": "REBUILD",
 }
 
 
@@ -171,7 +208,7 @@ class CreateResult:
             return "QUEUEING"
         if self.rc_code == VERIFY_CODE:
             return "VERIFY_REQUIRED"
-        if (self.mode or "").lower() == LIMITING_MODE:
+        if normalize_mode(self.mode) == LIMITING_MODE:
             return "RATE_LIMITED"
         return None
 
@@ -292,6 +329,8 @@ class SubmissionSession:
         self.guard.submitting()
         sender = asyncio.create_task(send())
         limiting_retries = 0
+        retry_used = False
+        token_fallback: tuple[CreateResult, int] | None = None
         waiting_for_risk = False
         reported_risks: set[tuple[RiskState, str | None]] = set()
         try:
@@ -320,21 +359,33 @@ class SubmissionSession:
                         )
                     )
                 if risk == "RATE_LIMITED":
-                    if limiting_retries >= MAX_LIMITING_RETRIES:
-                        await _finish_sender(sender)
-                        self.guard.ready()
-                        return SubmissionOutcome(result, self.lease.request_count)
-                    limiting_retries += 1
+                    if limiting_retries < MAX_LIMITING_RETRIES:
+                        limiting_retries += 1
+                        self.lease.allow_retry()
+                        request_count = self.lease.request_count
+                        await asyncio.sleep(LIMITING_INTERVAL_SECONDS)
+                        if self.lease.request_count == request_count and sender.done():
+                            await _finish_sender(sender)
+                            sender = asyncio.create_task(send())
+                        waiting_for_risk = True
+                        continue
+                if (
+                    risk == "RATE_LIMITED" or result.mode == "retry"
+                ) and not retry_used:
+                    retry_used = True
                     self.lease.allow_retry()
-                    request_count = self.lease.request_count
-                    await asyncio.sleep(LIMITING_INTERVAL_SECONDS)
-                    if self.lease.request_count == request_count and sender.done():
-                        await _finish_sender(sender)
-                        sender = asyncio.create_task(send())
+                    await self._click_official_retry(timeout_seconds)
                     waiting_for_risk = True
                     continue
                 if risk in {"QUEUEING", "VERIFY_REQUIRED"}:
                     waiting_for_risk = True
+                    continue
+                if (
+                    TOKEN_EXPIRED_CODE in {result.code, result.sub_code}
+                    and token_fallback is None
+                ):
+                    token_fallback = (result, self.lease.request_count)
+                    self.lease.allow_retry()
                     continue
 
                 await _finish_sender(sender)
@@ -344,6 +395,11 @@ class SubmissionSession:
                     self.guard.ready()
                 return SubmissionOutcome(result, self.lease.request_count)
         except TimeoutError:
+            if token_fallback is not None:
+                result, request_count = token_fallback
+                if self.lease.request_count == request_count:
+                    self.guard.ready()
+                    return SubmissionOutcome(result, request_count)
             self.guard.unknown()
             raise
         finally:
@@ -351,6 +407,15 @@ class SubmissionSession:
                 sender.cancel()
                 await asyncio.gather(sender, return_exceptions=True)
             self.lease.close()
+
+    async def _click_official_retry(self, timeout_seconds: float) -> None:
+        retry = self.page.get_by_text("重试", exact=True).last
+        try:
+            await retry.wait_for(state="visible", timeout=timeout_seconds * 1000)
+            await retry.evaluate("node => node.click()")
+        except Exception as exc:
+            self.guard.ready()
+            raise RuntimeError("官方重试按钮未出现") from exc
 
     async def _route(self, route: Route, request: Request) -> None:
         if request.method.upper() != "POST" or not is_create_url(request.url):
@@ -435,12 +500,12 @@ async def parse_create_response(response: Response) -> CreateResult:
             payment_deadline_ms,
             unpaid_transaction_count,
         ) = _cart_create_details(payload)
-    code = _find_scalar(payload, ("code", "statusCode", "errorCode"))
+    code = _response_scalar(payload, ("statusCode", "code", "errorCode"))
     message = (
         redact_preview(
-            _find_scalar(
+            _response_scalar(
                 payload,
-                ("message", "msg", "errorMessage", "errorMsg", "comments", "desc"),
+                ("comments", "message", "msg", "errorMessage", "errorMsg", "desc"),
             )
             or "",
             limit=300,
@@ -456,9 +521,9 @@ async def parse_create_response(response: Response) -> CreateResult:
         unpaid_transaction_count=unpaid_transaction_count,
         http_status=response.status,
         code=code,
-        sub_code=_find_scalar(payload, ("subCode", "sub_code", "bizCode")),
+        sub_code=_response_scalar(payload, ("subCode", "sub_code", "bizCode")),
         message=message,
-        mode=_find_scalar(payload, ("mode",)),
+        mode=normalize_mode(_response_scalar(payload, ("mode",))),
         rc_code=_response_header(response, "rc-code"),
         rc_id=_response_header(response, "rc-id"),
         rc_show_id=_response_header(response, "rc-show-id"),
@@ -470,10 +535,12 @@ def create_failure_action(result: CreateResult) -> FailureAction:
     for code in codes:
         if action := CREATE_FAILURE_ACTIONS.get(code):
             return action
-    if not 200 <= result.http_status < 300 or any(
-        code not in SUCCESS_CODES for code in codes
-    ):
+    if action := MODE_FAILURE_ACTIONS.get(normalize_mode(result.mode) or ""):
+        return action
+    if not 200 <= result.http_status < 300:
         return "FAILED"
+    if any(code not in SUCCESS_CODES for code in codes):
+        return "RETRY"
     return "UNKNOWN"
 
 
@@ -557,21 +624,23 @@ def _response_success(
     )
 
 
-def _find_scalar(payload: object, keys: tuple[str, ...]) -> str | None:
-    if isinstance(payload, dict):
-        for key in keys:
-            value = payload.get(key)
-            if isinstance(value, str | int | float | bool):
-                return str(value)
-        for value in payload.values():
-            found = _find_scalar(value, keys)
-            if found is not None:
-                return found
-    elif isinstance(payload, list):
-        for value in payload:
-            found = _find_scalar(value, keys)
-            if found is not None:
-                return found
+def normalize_mode(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    lowered = text.lower().replace("-", "_")
+    return MODE_NAMES.get(text, "back_refresh" if lowered == "backrefresh" else lowered)
+
+
+def _response_scalar(payload: object, keys: tuple[str, ...]) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str | int | float | bool):
+            return str(value)
     return None
 
 

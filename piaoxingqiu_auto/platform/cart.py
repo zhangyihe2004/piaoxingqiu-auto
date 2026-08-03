@@ -21,6 +21,7 @@ from piaoxingqiu_auto.domain.models import (
 from piaoxingqiu_auto.domain.seating import Candidate, SeatSelection
 from piaoxingqiu_auto.platform.auth import AuthGuard
 from piaoxingqiu_auto.platform.inventory import GeneralAdmissionSelection, Inventory
+from piaoxingqiu_auto.platform.order_model import OfficialOrderModel, has_discount
 from piaoxingqiu_auto.platform.submission import (
     LIMITING_INTERVAL_SECONDS,
     LIMITING_MODE,
@@ -29,13 +30,13 @@ from piaoxingqiu_auto.platform.submission import (
     RiskEvent,
     RiskNotice,
     VERIFY_CODE,
+    normalize_mode,
 )
 
 
 PRE_ORDER_PATH = "/cyy_gatewayapi/trade/buyer/order/cart/v1/pre_order"
 CREATE_ORDER_PATH = "/cyy_gatewayapi/trade/buyer/order/cart/v1/create_order"
 POSITIONING_PATH = "/cyy_gatewayapi/mcommon/pub/v1/positioning"
-PROMOTIONS_PATH = "/cyy_gatewayapi/show/pub/v3/promotions/list"
 _LAST_TICKET_TIMESTAMP = 0
 
 
@@ -55,7 +56,7 @@ class CartRejected(RuntimeError):
         self.code = code
         self.sub_code = sub_code
         self.message = message
-        self.mode = mode
+        self.mode = normalize_mode(mode)
         self.rc_code = rc_code
         self.rc_id = rc_id
         self.rc_show_id = rc_show_id
@@ -86,9 +87,6 @@ class CartOrder:
     summary: OrderSummary
 
 
-_ComboPriceGroup = tuple[tuple[str, float], ...]
-
-
 class CartClient:
     def __init__(
         self,
@@ -101,10 +99,15 @@ class CartClient:
         self.auth = auth
         self.cache = cache if cache is not None else {}
         self.risk_notice = risk_notice
+        self.order_model = OfficialOrderModel(site.page, *site.booking_ids)
 
     async def warm(self, audiences: tuple[AudienceConfig, ...]) -> None:
         await self.site.prepare_booking()
-        operations = [self._load_client(), self._location_id()]
+        operations = [
+            self._load_client(),
+            self.order_model.warm(),
+            self._location_id(),
+        ]
         if audiences:
             operations.append(self._audience_ids(audiences))
         await asyncio.gather(*operations)
@@ -122,7 +125,7 @@ class CartClient:
             self.site.config.purchase.plan_ids,
             inventory.plan_prices,
         )
-        pre_request, price_groups, combo_tag = _seat_preorder(
+        pre_request = _seat_preorder(
             scheme,
             inventory.plan_prices,
             show_id,
@@ -136,9 +139,6 @@ class CartClient:
             len(selection.candidates),
             len(selection.candidates),
             tuple(dict.fromkeys(item.plan for item in selection.candidates)),
-            price_groups,
-            combo_tag,
-            inventory.has_activity,
         )
 
     async def prepare_general(
@@ -147,7 +147,7 @@ class CartClient:
         audiences: tuple[AudienceConfig, ...],
     ) -> CartOrder:
         show_id, session_id = self.site.booking_ids
-        pre_request, price_groups, combo_tag = _general_preorder(
+        pre_request = _general_preorder(
             selection,
             show_id,
             session_id,
@@ -160,9 +160,6 @@ class CartClient:
             selection.units,
             selection.ticket_count,
             (selection.plan,),
-            price_groups,
-            combo_tag,
-            selection.has_activity,
         )
 
     async def create(self, payload: dict) -> None:
@@ -186,9 +183,6 @@ class CartClient:
         quantity: int,
         ticket_count: int,
         plans: tuple[str, ...],
-        price_groups: tuple[_ComboPriceGroup, ...],
-        combo_tag: str | None,
-        has_activity: bool,
     ) -> CartOrder:
         required = required_audience_count(
             self.site.config.purchase.real_name_mode, ticket_count
@@ -201,34 +195,29 @@ class CartClient:
         pre_started = asyncio.get_running_loop().time()
         pre_task = asyncio.create_task(self._preorder(pre_request))
         location_task = asyncio.create_task(self._location_id())
+        model_task = asyncio.create_task(self.order_model.warm())
         audience_task = (
             asyncio.create_task(self._audience_ids(selected)) if selected else None
         )
-        promotion_task = (
-            asyncio.create_task(self._promotions()) if has_activity else None
-        )
         tasks = tuple(
             task
-            for task in (pre_task, location_task, audience_task, promotion_task)
+            for task in (pre_task, location_task, model_task, audience_task)
             if task
         )
         try:
-            pre_response, location_id = await asyncio.gather(pre_task, location_task)
+            pre_response, location_id, _ = await asyncio.gather(
+                pre_task,
+                location_task,
+                model_task,
+            )
             audience_ids = await audience_task if audience_task else []
-            promotions = await promotion_task if promotion_task else None
-            pre_has_activity = any(
-                item.get("priceItemType") == "ACTIVITY_DISCOUNT_FEE"
-                for item in pre_response["data"]["orders"][0]["priceItems"]
+            payload = await self.order_model.build(
+                pre_request,
+                pre_response,
+                audience_ids,
+                self.site.config.purchase.real_name_mode,
+                location_id,
             )
-            if promotions is None and pre_has_activity:
-                promotions = await self._promotions()
-            activity_prices = (
-                await self._activity_prices(pre_request, promotions)
-                if promotions is not None
-                else []
-            )
-            if pre_has_activity and not activity_prices:
-                raise RuntimeError("官方购物模型未生成预下单中的活动优惠")
         except BaseException:
             for task in tasks:
                 if not task.done():
@@ -239,17 +228,6 @@ class CartClient:
             self.site.record_timing(
                 "pre_order", asyncio.get_running_loop().time() - pre_started
             )
-        payload = _create_payload(
-            pre_request,
-            pre_response,
-            location_id,
-            audience_ids,
-            self.site.config.purchase.real_name_mode,
-            price_groups,
-            combo_tag,
-            promotions,
-            activity_prices,
-        )
         return CartOrder(
             payload,
             selected,
@@ -257,10 +235,7 @@ class CartClient:
                 quantity,
                 plans,
                 _display_money(payload["paymentParam"]["payAmount"]),
-                any(
-                    float(item["priceItemVal"]) < 0
-                    for item in payload["priceItemParams"]
-                ),
+                has_discount(payload),
             ),
         )
 
@@ -322,137 +297,6 @@ class CartClient:
             raise RuntimeError("定位接口未返回 locationId")
         self.cache["location_id"] = location_id
         return location_id
-
-    async def _promotions(self) -> dict:
-        show_id, _ = self.site.booking_ids
-        payload = await self._request(
-            f"{PROMOTIONS_PATH}?showId={show_id}&verControl=true",
-            {},
-            method="GET",
-        )
-        return payload["data"]
-
-    async def _activity_prices(
-        self,
-        pre_request: dict,
-        promotions: dict,
-    ) -> list[dict]:
-        prices = await self.site.page.evaluate(
-            """
-            async ({ preRequest, promotions }) => {
-              const resources = performance.getEntriesByType("resource")
-                .map(entry => entry.name)
-                .filter(url => /\\/shopping\\.[^/]+\\.js(?:\\?|$)/.test(url));
-              let SaleAssistant;
-              let PromotionDiscount;
-              for (const url of resources) {
-                const loaded = await import(url);
-                SaleAssistant = Object.values(loaded).find(
-                  value => typeof value?.prototype?.takeTickets === "function"
-                    && typeof value?.prototype?.selectShow === "function"
-                );
-                PromotionDiscount = Object.values(loaded).find(
-                  value => value?.PromotionDiscountType === "promotionDiscount"
-                );
-                if (SaleAssistant && PromotionDiscount) {
-                  break;
-                }
-              }
-              if (!SaleAssistant || !PromotionDiscount) {
-                throw new Error("未找到官方购物模型");
-              }
-
-              const order = preRequest.orders[0];
-              const firstItem = order.items[0];
-              const showId = firstItem.spu.showId;
-              const sessionId = firstItem.spu.sessionId;
-              const [sessionResponse, planResponse] = await Promise.all([
-                fetch(
-                  `/cyy_gatewayapi/show/pub/v5/show/${showId}/sessions`
-                  + "?source=FROM_QUICK_ORDER&src=WEB"
-                ).then(response => response.json()),
-                fetch(
-                  `/cyy_gatewayapi/show/pub/v5/show/${showId}/session/`
-                  + `${sessionId}/seat_plans?source=FROM_QUICK_ORDER&src=WEB`
-                ).then(response => response.json())
-              ]);
-              const session = sessionResponse.data?.find(
-                item => item.bizShowSessionId === sessionId
-              );
-              const plans = planResponse.data?.seatPlans || [];
-              if (!session || !plans.length) {
-                throw new Error("官方购物模型缺少场次或票档数据");
-              }
-
-              const tickets = [];
-              for (const item of order.items) {
-                const plan = plans.find(
-                  value => value.seatPlanId === item.sku.skuId
-                );
-                if (!plan) {
-                  throw new Error(`官方购物模型未找到票档 ${item.sku.skuId}`);
-                }
-                for (const ticket of item.sku.ticketItems) {
-                  const base = item.sku.skuType === "COMBO"
-                    ? plan.items?.find(
-                        value => [
-                          value.stdSeatPlanId,
-                          value.bizSeatPlanId,
-                          value.seatPlanId
-                        ].includes(ticket.comboItemId)
-                      )
-                    : plan;
-                  if (!base) throw new Error("官方购物模型未找到套票子票档");
-                  tickets.push({
-                    generateId: ticket.id,
-                    stdSeatPlanId: base.stdSeatPlanId,
-                    seatPlanId: base.bizSeatPlanId || base.seatPlanId,
-                    seatPlanName: base.itemSeatPlanName || base.seatPlanName,
-                    originalPrice: base.originalPrice,
-                    ticketPrice: base.originalPrice,
-                    seatId: ticket.seatConcreteId,
-                    zoneConcreteId: ticket.zoneConcreteId,
-                    groupId: ticket.groupId,
-                    ...(item.sku.skuType === "COMBO"
-                      ? {
-                          combo: {
-                            ...plan,
-                            id: ticket.seatGroupId || ticket.id,
-                            comboId: plan.seatPlanId,
-                            comboPrice: plan.originalPrice
-                          }
-                        }
-                      : {})
-                  });
-                }
-              }
-
-              const assistant = new SaleAssistant();
-              assistant.selectShow({
-                showId,
-                stdShowId: plans[0].stdShowId
-              });
-              assistant.selectSession(session);
-              assistant.takeTickets(tickets);
-              assistant.useDiscount(new PromotionDiscount([
-                ...(promotions.sameSessionPromotions || []),
-                ...(promotions.crossSessionPromotions || [])
-              ]));
-              return assistant.priceItems
-                .filter(
-                  item => item.priceItemType === "ACTIVITY_DISCOUNT_FEE"
-                )
-                .map(item => JSON.parse(JSON.stringify(item)));
-            }
-            """,
-            {
-                "preRequest": pre_request,
-                "promotions": promotions,
-            },
-        )
-        if not isinstance(prices, list):
-            raise RuntimeError("官方购物模型未返回活动价格参数")
-        return prices
 
     async def _load_client(self) -> None:
         await self.site.page.evaluate(
@@ -569,7 +413,7 @@ def _risk_event(error: CartRejected) -> RiskEvent | None:
         QUEUE_CODE: "QUEUEING",
         VERIFY_CODE: "VERIFY_REQUIRED",
     }.get(error.rc_code)
-    if state is None and (error.mode or "").lower() == LIMITING_MODE:
+    if state is None and error.mode == LIMITING_MODE:
         state = "RATE_LIMITED"
     return (
         RiskEvent(state, "PRE_ORDER", error.rc_id, error.rc_show_id)
@@ -619,7 +463,7 @@ def _seat_preorder(
     session_id: str,
     ver: str,
     source: str,
-) -> tuple[dict, tuple[_ComboPriceGroup, ...], str | None]:
+) -> dict:
     grouped: OrderedDict[str, list[Candidate]] = OrderedDict()
     for candidate in scheme.singles:
         grouped.setdefault(candidate.plan_id, []).append(candidate)
@@ -650,7 +494,6 @@ def _seat_preorder(
         )
 
     combo_items = []
-    discounted_tickets = []
     by_variant: OrderedDict[str, list[ComboInstance]] = OrderedDict()
     for instance in scheme.combos:
         by_variant.setdefault(instance.variant.sku_id, []).append(instance)
@@ -663,13 +506,6 @@ def _seat_preorder(
             components = variant.components
             if len(components) != len(instance.candidates):
                 raise RuntimeError("套票组成数量与所选座位数不一致")
-            discount = sum(price for _, price in components) - variant.price
-            discounted_tickets.extend(
-                zip(
-                    ticket_ids,
-                    _split_discount(discount, [price for _, price in components]),
-                )
-            )
             tickets.extend(
                 {
                     "comboItemId": component_id,
@@ -697,13 +533,7 @@ def _seat_preorder(
                 "spu": {"sessionId": session_id, "showId": show_id},
             }
         )
-    price_groups = (tuple(discounted_tickets),) if discounted_tickets else ()
-    combo_tag = (
-        "COMBO"
-        if any(item.variant.display_tag == "COMBO" for item in scheme.combos)
-        else "DISCOUNT" if scheme.combos else None
-    )
-    return _base_request(combo_items + single_items, ver, source), price_groups, combo_tag
+    return _base_request(combo_items + single_items, ver, source)
 
 
 def _general_preorder(
@@ -712,7 +542,7 @@ def _general_preorder(
     session_id: str,
     ver: str,
     source: str,
-) -> tuple[dict, tuple[_ComboPriceGroup, ...], str | None]:
+) -> dict:
     ticket_ids = iter(_ticket_ids(selection.ticket_count))
     tickets = []
     if selection.combo_items:
@@ -721,14 +551,9 @@ def _general_preorder(
             for plan_id, count, price in selection.combo_items
             for _ in range(count)
         ]
-        discounts = _split_discount(
-            sum(price for _, price in components) - selection.price,
-            [price for _, price in components],
-        )
         seat_group_ids = _ticket_ids(selection.units)
-        unit_groups = [[] for _ in range(selection.units)]
-        for (plan_id, _), discount in zip(components, discounts):
-            for unit, seat_group_id in enumerate(seat_group_ids):
+        for plan_id, _ in components:
+            for seat_group_id in seat_group_ids:
                 ticket_id = next(ticket_ids)
                 tickets.append({
                     "comboItemId": plan_id,
@@ -736,17 +561,12 @@ def _general_preorder(
                     "id": ticket_id,
                     "seatGroupId": seat_group_id,
                 })
-                unit_groups[unit].append((ticket_id, discount))
-        groups = (
-            tuple(item for group in unit_groups for item in group),
-        )
     else:
         tickets.extend(
             {"groupId": "default", "id": ticket_id}
             for ticket_id in ticket_ids
         )
-        groups = ()
-    request = _base_request(
+    return _base_request(
         [{
             "sku": {
                 "qty": selection.units,
@@ -760,275 +580,12 @@ def _general_preorder(
         ver,
         source,
     )
-    return request, groups, "COMBO" if groups else None
-
-
-def _create_payload(
-    pre_request: dict,
-    pre_response: dict,
-    location_id: str,
-    audience_ids: list[str],
-    real_name_mode: str,
-    groups: tuple[_ComboPriceGroup, ...],
-    combo_tag: str | None,
-    promotions: dict | None,
-    activity_prices: list[dict],
-) -> dict:
-    response_order = pre_response["data"]["orders"][0]
-    prices = sorted(
-        [
-            item
-            for item in response_order["priceItems"]
-            if item["priceItemType"] != "ACTIVITY_DISCOUNT_FEE"
-        ]
-        + activity_prices,
-        key=lambda item: item["priceItemType"] != "TICKET_FEE",
-    )
-    order = pre_request["orders"][0]
-    items, ticket_index = _create_items(
-        order,
-        response_order["supportDeliveries"][0]["name"],
-        audience_ids,
-        real_name_mode,
-        promotions,
-    )
-    params = _price_params(prices)
-    for price, param in zip(prices, params):
-        if price["priceItemType"] == "COMBO_DISCOUNT_FEE":
-            applications = _combo_applications(
-                groups,
-                ticket_index,
-                abs(float(price["priceItemVal"])),
-            )
-            param.update(
-                {
-                    "applyTickets": applications,
-                    "discountId": "comboDiscount",
-                    "priceItemTitle": price["priceItemName"],
-                }
-            )
-            if combo_tag is None:
-                raise RuntimeError("FREE_COMBO 缺少官方显示类型")
-            param["tag"] = combo_tag
-    ticket_total = next(
-        item for item in prices if item["priceItemType"] == "TICKET_FEE"
-    )
-    result = _create_base(
-        pre_request,
-        location_id,
-        items,
-        _money(ticket_total["priceItemVal"]),
-        _money(sum(float(item["priceItemVal"]) for item in prices)),
-        params,
-    )
-    if real_name_mode == "PER_ORDER":
-        result["orders"][0]["many2OneAudience"] = {
-            "audienceId": audience_ids[0],
-            "sessionIds": list(
-                dict.fromkeys(item["spu"]["sessionId"] for item in order["items"])
-            ),
-        }
-    return result
-
-
-def _create_items(
-    order: dict,
-    delivery: str,
-    audience_ids: list[str],
-    real_name_mode: str,
-    promotions: dict | None,
-) -> tuple[list[dict], dict[str, tuple[dict, dict, str]]]:
-    ticket_count = sum(len(item["sku"]["ticketItems"]) for item in order["items"])
-    if real_name_mode == "PER_TICKET" and len(audience_ids) != ticket_count:
-        raise RuntimeError("观演人数量与票数不一致")
-    audience_iter = iter(audience_ids)
-    items = []
-    ticket_index = {}
-    for item in order["items"]:
-        tickets = []
-        for ticket in item["sku"]["ticketItems"]:
-            created = {
-                **ticket,
-                "audienceId": (
-                    next(audience_iter) if real_name_mode == "PER_TICKET" else ""
-                ),
-            }
-            tickets.append(created)
-            ticket_index[ticket["id"]] = (
-                ticket,
-                item["spu"],
-                item["sku"]["skuId"],
-            )
-        items.append(
-            _create_item(
-                item,
-                tickets,
-                delivery,
-                promotions,
-            )
-        )
-    return items, ticket_index
-
-
-def _price_params(prices: list[dict]) -> list[dict]:
-    return [
-        (
-            {**price, "priceItemVal": _money(price["priceItemVal"])}
-            if price["priceItemType"] == "ACTIVITY_DISCOUNT_FEE"
-            else {
-                "applyTickets": [],
-                "priceItemName": (
-                    "票款总额"
-                    if price["priceItemType"] == "TICKET_FEE"
-                    else price["priceItemName"]
-                ),
-                "priceItemVal": _money(price["priceItemVal"]),
-                "priceItemType": price["priceItemType"],
-                "priceItemSpecies": price["priceItemSpecies"],
-                "direction": price["direction"],
-                "priceDisplay": _price_display(price["priceItemVal"]),
-            }
-        )
-        for price in prices
-    ]
-
-
-def _combo_applications(
-    groups: tuple[_ComboPriceGroup, ...],
-    ticket_index: dict[str, tuple[dict, dict, str]],
-    actual_discount: float,
-) -> list[list[dict]]:
-    expected = sum(discount for group in groups for _, discount in group)
-    if not groups or abs(expected - actual_discount) > 0.02:
-        raise RuntimeError("FREE_COMBO 优惠与预下单结果不一致")
-    return [
-        [
-            _discount_ticket(ticket_index[ticket_id], discount)
-            for ticket_id, discount in group
-        ]
-        for group in groups
-    ]
-
-
-def _discount_ticket(
-    indexed: tuple[dict, dict, str],
-    discount: float,
-) -> dict:
-    ticket, spu, sku_id = indexed
-    result = {
-        "id": ticket["id"],
-        "discountAmount": _display_money(discount),
-        "seatPlanId": sku_id,
-        "showId": spu["showId"],
-        "sessionId": spu["sessionId"],
-        "groupId": ticket["groupId"],
-    }
-    result.update(
-        {
-            key: ticket[key]
-            for key in ("seatConcreteId", "zoneConcreteId", "seatGroupId")
-            if key in ticket
-        }
-    )
-    return result
-
-
-def _split_discount(total: float, weights: list[float]) -> list[float]:
-    cents = round(total * 100)
-    weight_cents = [round(weight * 100) for weight in weights]
-    total_weight = sum(weight_cents)
-    if cents < 0 or not weights or total_weight < 1:
-        raise RuntimeError("套票优惠数据无效")
-    divided = [divmod(cents * weight, total_weight) for weight in weight_cents]
-    values = [value for value, _ in divided]
-    remainder = cents - sum(values)
-    for index in sorted(
-        range(len(values)),
-        key=lambda item: divided[item][1],
-        reverse=True,
-    )[:remainder]:
-        values[index] += 1
-    return [value / 100 for value in values]
-
-
-def _create_item(
-    item: dict,
-    tickets: list[dict],
-    delivery: str,
-    promotions: dict | None,
-) -> dict:
-    promotions = promotions or {}
-    return {
-        "sku": {
-            **item["sku"],
-            "ticketPrice": _money(item["sku"]["ticketPrice"]),
-            "ticketItems": tickets,
-        },
-        "spu": {
-            **item["spu"],
-            "promotionVersionHash": (
-                promotions.get("promotionVersionHash") or "EMPTY_PROMOTION_HASH"
-            ),
-            "addPromoVersionHash": (
-                promotions.get("addPromoVersionHash") or "EMPTY_PROMOTION_HASH"
-            ),
-        },
-        "deliverMethod": delivery,
-    }
-
-
-def _create_base(
-    pre_request: dict,
-    location_id: str,
-    items: list[dict],
-    total: str,
-    payable: str,
-    prices: list[dict],
-) -> dict:
-    order = pre_request["orders"][0]
-    return {
-        "src": pre_request["src"],
-        "ver": pre_request["ver"],
-        "addressParam": {},
-        "locationParam": {
-            "locationCityId": location_id,
-            "bsCityId": location_id,
-        },
-        "paymentParam": {"totalAmount": total, "payAmount": payable},
-        "priceItemParams": prices,
-        "orders": [
-            {
-                "items": items,
-                "priorityId": "",
-                "sourceOrderId": "",
-                "addPurchasePromotionId": "",
-                "scene": pre_request["scene"],
-                "exchangeRate": 1,
-                "clientCurrency": order["clientCurrency"],
-                "many2OneAudience": {},
-                "orderSource": order["orderSource"],
-                "groupId": order["groupId"],
-            }
-        ],
-        "scene": pre_request["scene"],
-        "clientCurrency": pre_request["clientCurrency"],
-        "orderFrom": "DEFAULT",
-    }
 
 
 def _number(value: float) -> int | float:
     return int(value) if value.is_integer() else value
 
 
-def _money(value: Any) -> str:
-    return f"{float(value):.2f}"
-
-
 def _display_money(value: Any) -> str:
     number = float(value)
     return str(int(number)) if number.is_integer() else f"{number:.2f}"
-
-
-def _price_display(value: Any) -> str:
-    number = float(value)
-    return f"{'-￥' if number < 0 else '￥'}{_display_money(abs(number))}"
