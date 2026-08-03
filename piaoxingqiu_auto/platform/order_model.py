@@ -6,7 +6,7 @@ from typing import Any
 
 
 _LOAD = r"""
-async ({showId, sessionId, data}) => {
+async ({showId, sessionId}) => {
   window.__pxqOfficialOrderModel ||= (async () => {
     const resources = performance.getEntriesByType("resource")
       .map(item => item.name);
@@ -41,23 +41,26 @@ async ({showId, sessionId, data}) => {
     const PromotionDiscount = shopping.find(
       value => value?.PromotionDiscountType === "promotionDiscount"
     );
+    const ComboDiscount = shopping.find(
+      value => value?.ComboDiscountType === "comboDiscount"
+    );
     const ConfirmOrder = confirmation.find(value =>
       typeof value === "function"
       && typeof value.prototype?.getCreateOrderParam === "function"
       && typeof value.prototype?.checkCreateOrderParam === "function"
     );
-    if (!SaleAssistant || !PromotionDiscount || !ConfirmOrder) {
+    if (!SaleAssistant || !PromotionDiscount || !ComboDiscount || !ConfirmOrder) {
       throw new Error("未找到官方订单模型");
     }
     return {
       SaleAssistant,
       PromotionDiscount,
+      ComboDiscount,
       ConfirmOrder,
       data: new Map(),
     };
   })();
   const model = await window.__pxqOfficialOrderModel;
-  if (!data) return true;
   const key = `${showId}:${sessionId}`;
   if (!model.data.has(key)) {
     model.data.set(key, Promise.all([
@@ -103,11 +106,23 @@ async ({preRequest, preResponse, audienceIds, realNameMode, locationId}) => {
   }
 
   const tickets = [];
+  const freeComboInstances = [];
   for (const item of order.items) {
     const plan = plans.find(value => value.seatPlanId === item.sku.skuId);
     if (!plan) throw new Error(`未找到票档 ${item.sku.skuId}`);
+    const isCombo = item.sku.skuType === "COMBO";
+    const isFreeCombo = isCombo && plan.seatPlanCategory === "FREE_COMBO";
+    if (isFreeCombo) {
+      const instances = {};
+      for (const ticket of item.sku.ticketItems) {
+        const id = ticket.seatGroupId || ticket.id;
+        (instances[id] ||= []).push(ticket.id);
+      }
+      for (const ticketGenerateIds of Object.values(instances)) {
+        freeComboInstances.push({comboId: plan.seatPlanId, ticketGenerateIds});
+      }
+    }
     for (const ticket of item.sku.ticketItems) {
-      const isCombo = item.sku.skuType === "COMBO";
       const ticketPlan = isCombo
         ? plan.items?.find(value => [
             value.stdSeatPlanId,
@@ -126,7 +141,7 @@ async ({preRequest, preResponse, audienceIds, realNameMode, locationId}) => {
         seatId: ticket.seatConcreteId,
         zoneConcreteId: ticket.zoneConcreteId,
         groupId: ticket.groupId,
-        ...(isCombo ? {
+        ...(isCombo && !isFreeCombo ? {
           combo: {
             ...plan,
             id: ticket.seatGroupId || ticket.id,
@@ -138,10 +153,17 @@ async ({preRequest, preResponse, audienceIds, realNameMode, locationId}) => {
     }
   }
 
-  const assistant = new model.SaleAssistant();
+  let assistant = new model.SaleAssistant();
   assistant.selectShow({showId, stdShowId: plans[0].stdShowId});
   assistant.selectSession(session);
   assistant.takeTickets(tickets);
+  assistant.useDiscount(new model.ComboDiscount());
+  if (freeComboInstances.length) {
+    assistant = assistant.applyFreeComboPlan({
+      seatPlans: plans,
+      plans: [{groupId: order.groupId, comboInstances: freeComboInstances}],
+    });
+  }
   const promotions = promotionResponse.data || {};
   assistant.useDiscount(new model.PromotionDiscount([
     ...(promotions.sameSessionPromotions || []),
@@ -169,7 +191,7 @@ async ({preRequest, preResponse, audienceIds, realNameMode, locationId}) => {
       displayedAudienceIds: audienceIds,
     });
   }
-  return confirm.getCreateOrderParam(
+  const payload = confirm.getCreateOrderParam(
     assistant,
     null,
     () => [],
@@ -178,6 +200,12 @@ async ({preRequest, preResponse, audienceIds, realNameMode, locationId}) => {
       localSite: locationId,
       bsCityId: locationId,
       tickets: mappedTickets,
+      promotionVersionHash:
+        promotions.promotionVersionHash || "EMPTY_PROMOTION_HASH",
+      addPromoVersionHash:
+        promotions.addPromoVersionHash || "EMPTY_PROMOTION_HASH",
+      orderCurrency: preRequest.clientCurrency,
+      exchangeRate: 1,
       scene: preRequest.scene,
       orderFrom: "DEFAULT",
     },
@@ -186,6 +214,22 @@ async ({preRequest, preResponse, audienceIds, realNameMode, locationId}) => {
     "",
     {groupAudienceInfoMap},
   );
+  payload.src = preRequest.src;
+  payload.ver = preRequest.ver;
+  for (const resultOrder of payload.orders || []) {
+    resultOrder.priorityId ??= order.priorityId || "";
+    for (const item of resultOrder.items || []) {
+      for (const ticket of item.sku?.ticketItems || []) {
+        for (const key of ["comboItemId", "seatGroupId", "ticketSeatId"]) {
+          if (!ticket[key]) delete ticket[key];
+        }
+      }
+    }
+  }
+  for (const item of payload.priceItemParams || []) {
+    if (!item.priceItemId) delete item.priceItemId;
+  }
+  return payload;
 }
 """
 
@@ -199,7 +243,7 @@ class OfficialOrderModel:
     async def warm(self) -> None:
         await self.page.evaluate(
             _LOAD,
-            {"showId": self.show_id, "sessionId": self.session_id, "data": True},
+            {"showId": self.show_id, "sessionId": self.session_id},
         )
 
     async def build(
@@ -210,7 +254,6 @@ class OfficialOrderModel:
         real_name_mode: str,
         location_id: str,
     ) -> dict:
-        await self.warm()
         payload = await self.page.evaluate(
             _BUILD,
             {
