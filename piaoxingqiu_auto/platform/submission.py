@@ -583,6 +583,8 @@ async def _finish_sender(sender: asyncio.Task[None]) -> None:
 
 
 def _payload_digest(payload: object) -> str:
+    if isinstance(payload, dict):
+        payload = {key: value for key, value in payload.items() if key not in {"src", "ver"}}
     serialized = json.dumps(
         payload,
         ensure_ascii=False,
