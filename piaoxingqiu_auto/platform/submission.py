@@ -87,7 +87,8 @@ MODE_FAILURE_ACTIONS: dict[str, FailureAction] = {
     "back": "REBUILD",
     "waiting": "FAILED",
     "back_refresh": "REBUILD",
-    "retry": "FAILED",
+    "retry": "RESELECT",
+    "limiting": "RESELECT",
     "booking": "REBUILD",
 }
 
@@ -361,20 +362,28 @@ class SubmissionSession:
                 if risk == "RATE_LIMITED":
                     if limiting_retries < MAX_LIMITING_RETRIES:
                         limiting_retries += 1
-                        self.lease.allow_retry()
-                        request_count = self.lease.request_count
-                        await asyncio.sleep(LIMITING_INTERVAL_SECONDS)
-                        if self.lease.request_count == request_count and sender.done():
-                            await _finish_sender(sender)
-                            sender = asyncio.create_task(send())
-                        waiting_for_risk = True
-                        continue
-                if (
-                    risk == "RATE_LIMITED" or result.mode == "retry"
-                ) and not retry_used:
-                    retry_used = True
+                    elif not retry_used:
+                        # 官方 mode=10：仍使用原业务体自动重发一次。
+                        retry_used = True
+                    else:
+                        # 已耗尽官方限流重试。不要点击页面按钮，也不要
+                        # 复用已经被风控终止的座位；交给任务级回流重新选座。
+                        await _finish_sender(sender)
+                        self.guard.ready()
+                        return SubmissionOutcome(result, self.lease.request_count)
+                    await asyncio.sleep(LIMITING_INTERVAL_SECONDS)
+                    await _finish_sender(sender)
                     self.lease.allow_retry()
-                    await self._click_official_retry(timeout_seconds)
+                    sender = asyncio.create_task(send())
+                    waiting_for_risk = True
+                    continue
+                if result.mode == "retry" and not retry_used:
+                    # 结构化 mode=10 也只允许一次原请求重发；不依赖 UI。
+                    retry_used = True
+                    await asyncio.sleep(LIMITING_INTERVAL_SECONDS)
+                    await _finish_sender(sender)
+                    self.lease.allow_retry()
+                    sender = asyncio.create_task(send())
                     waiting_for_risk = True
                     continue
                 if risk in {"QUEUEING", "VERIFY_REQUIRED"}:
@@ -407,15 +416,6 @@ class SubmissionSession:
                 sender.cancel()
                 await asyncio.gather(sender, return_exceptions=True)
             self.lease.close()
-
-    async def _click_official_retry(self, timeout_seconds: float) -> None:
-        retry = self.page.get_by_text("重试", exact=True).last
-        try:
-            await retry.wait_for(state="visible", timeout=timeout_seconds * 1000)
-            await retry.evaluate("node => node.click()")
-        except Exception as exc:
-            self.guard.ready()
-            raise RuntimeError("官方重试按钮未出现") from exc
 
     async def _route(self, route: Route, request: Request) -> None:
         if request.method.upper() != "POST" or not is_create_url(request.url):
